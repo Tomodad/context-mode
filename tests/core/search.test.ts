@@ -2035,6 +2035,46 @@ describe("Store integration: highlighted field", () => {
     }
   });
 
+  test("hydrates each ranked porter and trigram candidate by its own rowid", () => {
+    const store = new ContentStore(":memory:");
+    try {
+      store.index({
+        source: "test-highlight-multiple-rows",
+        content: [
+          "# Alpha",
+          "shared needle alpha unique-one",
+          "# Beta",
+          "shared needle beta unique-two",
+          "# Gamma",
+          "shared needle gamma unique-three",
+        ].join("\n\n"),
+      });
+
+      const assertDistinctCandidates = (
+        results: Array<{ content: string }>,
+        index: "porter" | "trigram",
+      ) => {
+        assert.equal(results.length, 3, `Expected three ${index} candidates`);
+        assert.equal(
+          new Set(results.map((result) => result.content)).size,
+          3,
+          `${index} hydration must not repeat the first MATCH row`,
+        );
+        for (const marker of ["unique-one", "unique-two", "unique-three"]) {
+          assert.ok(
+            results.some((result) => result.content.includes(marker)),
+            `Expected ${index} results to retain ${marker}`,
+          );
+        }
+      };
+
+      assertDistinctCandidates(store.search("shared needle", 10), "porter");
+      assertDistinctCandidates(store.searchTrigram("shared needle", 10), "trigram");
+    } finally {
+      store.close();
+    }
+  });
+
   test("extractSnippet with store-produced highlighted finds stemmed region", () => {
     const store = new ContentStore(":memory:");
     try {

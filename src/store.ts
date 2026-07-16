@@ -800,8 +800,10 @@ export class ContentStore {
         chunks.content,
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
-      WHERE chunks.rowid = ?
-        AND chunks MATCH ?
+      WHERE chunks MATCH ?
+        -- better-sqlite3's older SQLite can ignore a scalar rowid equality
+        -- alongside MATCH; an IN subquery preserves the ranked candidate.
+        AND chunks.rowid IN (SELECT ?)
         AND length(CAST(chunks.content AS BLOB)) <= ?
     `);
     this.#stmtHydrateTrigram = this.#db.prepare(`
@@ -809,8 +811,8 @@ export class ContentStore {
         chunks_trigram.content,
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
-      WHERE chunks_trigram.rowid = ?
-        AND chunks_trigram MATCH ?
+      WHERE chunks_trigram MATCH ?
+        AND chunks_trigram.rowid IN (SELECT ?)
         AND length(CAST(chunks_trigram.content AS BLOB)) <= ?
     `);
 
@@ -1211,8 +1213,8 @@ export class ContentStore {
       : this.#stmtWindowTrigram;
 
     const normal = hydrateStmt.get(
-      row.rowid,
       ftsQuery,
+      row.rowid,
       MAX_CHUNK_BYTES,
     ) as SearchContentRow | undefined;
 
