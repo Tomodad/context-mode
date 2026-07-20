@@ -1,6 +1,8 @@
 import { performance } from "node:perf_hooks";
 import { ContentStore } from "../src/store.js";
 import {
+  DEFAULT_BATCH_SECTION_INVENTORY_LIMIT,
+  formatBatchSectionInventory,
   planBatchIngestion,
   resolveBatchIngestionPolicy,
   type BatchCapturedCommand,
@@ -32,6 +34,8 @@ interface Sample {
   peakRssDeltaBytes: number;
   largestIntermediateBytes: number;
   duplicateIntermediateBytes: number;
+  inventoryRows: number;
+  inventoryBytes: number;
 }
 
 function parseRepeats(): number {
@@ -161,6 +165,15 @@ function runLegacy(scenario: Scenario): Sample {
     0,
   );
   const afterIndex = memorySnapshot();
+  const inventory = [
+    "## Indexed Sections",
+    "",
+    ...rows.map((row) => {
+      const bytes = Buffer.byteLength(row.content, "utf8");
+      return `- ${row.title} (${(bytes / 1024).toFixed(1)}KB)`;
+    }),
+  ].join("\n");
+  const afterInventory = memorySnapshot();
   const wallMs = performance.now() - start;
   store.close();
 
@@ -183,15 +196,19 @@ function runLegacy(scenario: Scenario): Sample {
       afterFragments.heapUsed,
       afterJoin.heapUsed,
       afterIndex.heapUsed,
+      afterInventory.heapUsed,
     ),
     peakRssDeltaBytes: deltaPeak(
       before.rss,
       afterFragments.rss,
       afterJoin.rss,
       afterIndex.rss,
+      afterInventory.rss,
     ),
     largestIntermediateBytes: joinedBytes,
     duplicateIntermediateBytes: displayFragmentBytes + joinedBytes,
+    inventoryRows: rows.length,
+    inventoryBytes: Buffer.byteLength(inventory, "utf8"),
   };
 }
 
@@ -212,6 +229,8 @@ function runBudgeted(
     `bench:${mode}:${scenario.name}`,
   );
   const afterIndex = memorySnapshot();
+  const inventory = formatBatchSectionInventory(plan.chunks, indexed.totalChunks).join("\n");
+  const afterInventory = memorySnapshot();
   const wallMs = performance.now() - start;
   store.close();
 
@@ -230,14 +249,18 @@ function runBudgeted(
       before.heapUsed,
       afterPlan.heapUsed,
       afterIndex.heapUsed,
+      afterInventory.heapUsed,
     ),
     peakRssDeltaBytes: deltaPeak(
       before.rss,
       afterPlan.rss,
       afterIndex.rss,
+      afterInventory.rss,
     ),
     largestIntermediateBytes: plan.maxBufferedChunkBytes,
     duplicateIntermediateBytes: 0,
+    inventoryRows: Math.min(DEFAULT_BATCH_SECTION_INVENTORY_LIMIT, indexed.totalChunks),
+    inventoryBytes: Buffer.byteLength(inventory, "utf8"),
   };
 }
 
@@ -277,6 +300,8 @@ function summarize(samples: Sample[]): Record<string, unknown>[] {
       dropped_chunks: first.droppedChunks,
       largest_intermediate_bytes: first.largestIntermediateBytes,
       duplicate_intermediate_bytes: first.duplicateIntermediateBytes,
+      inventory_rows: first.inventoryRows,
+      inventory_bytes: first.inventoryBytes,
     };
   });
 }
@@ -306,6 +331,7 @@ console.log(JSON.stringify({
       memory: "max process.memoryUsage sample after assembly/planning and after indexing, relative to pre-run GC sample",
       largest_intermediate: "legacy joined display Markdown bytes versus budgeted planner maximum single prepared chunk bytes",
       duplicate_intermediate: "legacy formatted-fragment bytes plus joined Markdown bytes; budgeted path performs no batch-body join",
+      inventory: "legacy production path hydrates and lists every section; budgeted production formatter lists at most 50 prepared chunk metadata rows",
     },
   },
   policies: {

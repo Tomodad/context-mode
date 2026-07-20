@@ -17,6 +17,7 @@ import {
   DEFAULT_BATCH_INGESTION_LIMITS,
   batchIngestionStructuredContent,
   formatBatchIngestionSummary,
+  formatBatchSectionInventory,
   planBatchIngestion,
   resolveBatchIngestionPolicy,
   type BatchCapturedCommand,
@@ -3886,7 +3887,7 @@ EXAMPLE: ctx_batch_execute(
         .int()
         .min(1)
         .optional()
-        .describe("Maximum prepared chunks stored for the batch. Values above the default require allow_large_ingestion=true."),
+        .describe("Maximum prepared chunks generated for the batch. Values above the default require allow_large_ingestion=true."),
       allow_large_ingestion: z
         .boolean()
         .optional()
@@ -3990,12 +3991,7 @@ async ({
         );
       }
 
-      const allSections = store.getChunksBySource(indexed.sourceId);
-      const inventory: string[] = ["## Indexed Sections", ""];
-      for (const section of allSections) {
-        const bytes = Buffer.byteLength(section.content);
-        inventory.push(`- ${section.title} (${(bytes / 1024).toFixed(1)}KB)`);
-      }
+      const inventory = formatBatchSectionInventory(plan.chunks, indexed.totalChunks);
 
       const queryResults = formatBatchQueryResults(
         store,
