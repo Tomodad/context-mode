@@ -2105,6 +2105,34 @@ describe("Bounded FTS result hydration for legacy oversized rows", () => {
   const oversizedContent = (needle: string, fill = "x") =>
     `prefix ${fill.repeat(1_200_000)} ${needle} tail`;
 
+  test("Unicode legacy windows stay well-formed through snippet extraction", () => {
+    const store = createStoreWithLegacyOversizedRows([{
+      title: "Unicode legacy row", source: "legacy-unicode",
+      content: `${"🤖中".repeat(20_000)} authentication 认证完成 ${"😀".repeat(2_000)}`,
+    }]);
+    try {
+      for (const results of [store.search("authenticate"), store.searchTrigram("认证完成")]) {
+        assert.equal(results.length, 1);
+        const result = results[0];
+        assert.ok(result.content.length <= 6_002);
+        for (const text of [result.content, result.highlighted ?? "", extractSnippet(result.content, "authenticate", 501, result.highlighted)]) {
+          assert.equal(Buffer.from(text, "utf8").toString("utf8"), text);
+        }
+      }
+    } finally { store.cleanup(); }
+  });
+
+  test("OR hydration locates a later query term when the first is absent", () => {
+    const store = createStoreWithLegacyOversizedRows([{
+      title: "Later term row", source: "legacy-or", content: oversizedContent("authentication"),
+    }]);
+    try {
+      const results = store.search("absentneedle authentication", 1, "legacy-or", "OR");
+      assert.equal(results.length, 1);
+      assertBoundedMatch(results[0], "authentication");
+    } finally { store.cleanup(); }
+  });
+
   function assertBoundedMatch(
     result: { content: string; highlighted?: string },
     needle: string,

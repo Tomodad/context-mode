@@ -178,6 +178,8 @@ const MAX_CHUNK_BYTES = 4096;
 const SEARCH_RESULT_MAX_CHARS = 3000;
 const SEARCH_RESULT_CONTEXT_CHARS = 300;
 const SEARCH_LOCATION_PREFIX_CHARS = 6;
+// Bound extra legacy-row scans for unusually long OR queries.
+const SEARCH_LOCATION_MAX_TERMS = 32;
 
 // Blank-line sectioning is used only for output that is *naturally* sectioned:
 // at least a few sections, not an unbounded explosion, and no single section so
@@ -1198,7 +1200,7 @@ export class ContentStore {
 
   // ── Search ──
 
-  #searchLocationNeedles(query: string): { exact: string; prefix: string } {
+  #searchLocationNeedles(query: string): Array<{ exact: string; prefix: string }> {
     const words = dedupeTokens(
       query
         .replace(/['"(){}[\]*:^~]/g, " ")
@@ -1210,12 +1212,16 @@ export class ContentStore {
         ),
     );
     const meaningful = words.filter((word) => !STOPWORDS.has(word.toLowerCase()));
-    const exact = (meaningful[0] ?? words[0] ?? "").toLowerCase();
-    const exactChars = Array.from(exact);
-    const prefix = exactChars.length > SEARCH_LOCATION_PREFIX_CHARS
-      ? exactChars.slice(0, SEARCH_LOCATION_PREFIX_CHARS).join("")
-      : exact;
-    return { exact, prefix };
+    return (meaningful.length > 0 ? meaningful : words)
+      .slice(0, SEARCH_LOCATION_MAX_TERMS)
+      .map((word) => {
+        const exact = word.toLowerCase();
+        const exactChars = Array.from(exact);
+        const prefix = exactChars.length > SEARCH_LOCATION_PREFIX_CHARS
+          ? exactChars.slice(0, SEARCH_LOCATION_PREFIX_CHARS).join("")
+          : exact;
+        return { exact, prefix };
+      });
   }
 
   #markBoundedMatch(
@@ -1270,22 +1276,32 @@ export class ContentStore {
       highlighted = normal.highlighted;
     } else {
       const needles = this.#searchLocationNeedles(query);
-      let location = locateStmt.get(
-        needles.exact,
-        row.rowid,
-      ) as SearchLocationRow | undefined;
-      let matchPos = location?.match_pos ?? 0;
-      let matchedNeedle = needles.exact;
+      let location: SearchLocationRow | undefined;
+      let matchPos = 0;
+      let matchedNeedle = "";
       let expandToken = false;
 
-      if (matchPos === 0 && needles.prefix !== needles.exact) {
-        location = locateStmt.get(
-          needles.prefix,
-          row.rowid,
-        ) as SearchLocationRow | undefined;
+      // OR results need not contain the first query term. Try the remaining
+      // terms before falling back to a prefix window. Content stays in SQLite.
+      for (const needle of needles) {
+        location = locateStmt.get(needle.exact, row.rowid) as SearchLocationRow | undefined;
         matchPos = location?.match_pos ?? 0;
-        matchedNeedle = needles.prefix;
-        expandToken = matchPos > 0;
+        if (matchPos > 0) {
+          matchedNeedle = needle.exact;
+          break;
+        }
+      }
+      if (matchPos === 0) {
+        for (const needle of needles) {
+          if (needle.prefix === needle.exact) continue;
+          location = locateStmt.get(needle.prefix, row.rowid) as SearchLocationRow | undefined;
+          matchPos = location?.match_pos ?? 0;
+          if (matchPos > 0) {
+            matchedNeedle = needle.prefix;
+            expandToken = true;
+            break;
+          }
+        }
       }
 
       const matchLength = matchPos > 0 ? Array.from(matchedNeedle).length : 0;
