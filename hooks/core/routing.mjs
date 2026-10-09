@@ -12,7 +12,7 @@
 
 import {
   ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE, BASH_GUIDANCE, EXTERNAL_MCP_GUIDANCE,
-  createRoutingBlock, createReadGuidance, createGrepGuidance, createBashGuidance,
+  createRoutingBlock, createCodexRoutingBlock, createReadGuidance, createGrepGuidance, createBashGuidance,
   createExternalMcpGuidance,
 } from "../routing-block.mjs";
 import { createToolNamer } from "./tool-naming.mjs";
@@ -691,7 +691,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   const t = createToolNamer(platform || "claude-code");
 
   // Build platform-specific guidance/routing content
-  const routingBlock = platform ? createRoutingBlock(t) : ROUTING_BLOCK;
+  const routingBlock = platform === "codex" ? createCodexRoutingBlock(t) : platform ? createRoutingBlock(t) : ROUTING_BLOCK;
   const readGuidance = platform ? createReadGuidance(t) : READ_GUIDANCE;
   const grepGuidance = platform ? createGrepGuidance(t) : GREP_GUIDANCE;
   const bashGuidance = platform ? createBashGuidance(t) : BASH_GUIDANCE;
@@ -721,6 +721,10 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         // "allow" or no match → fall through to Stage 2
       }
     }
+
+    // Codex: RTK owns Shell rewrites; keep Stage 1 security checks above.
+    // Other tools and platforms retain context-mode routing.
+    if (platform === "codex") return null;
 
     // Stage 2: Context-mode routing (existing behavior)
 
@@ -846,6 +850,8 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   // event with the actual file size as bytes_avoided. Threshold = 50 000 bytes;
   // smaller reads stay on the existing one-shot guidance nudge.
   if (canonical === "Read") {
+    // Codex loads analysis guidance on demand, without a read-routing nudge.
+    if (platform === "codex") return null;
     const filePath = getReadFilePath(toolInput);
     if (filePath) {
       try {
@@ -868,11 +874,14 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // ─── Grep: nudge toward execute (once per session) ───
   if (canonical === "Grep") {
+    if (platform === "codex") return null;
     return guidanceOnce("grep", grepGuidance, sessionId);
   }
 
   // ─── WebFetch: deny + redirect to sandbox ───
   if (canonical === "WebFetch") {
+    // This branch is output-routing advice, not a security-policy check.
+    if (platform === "codex") return null;
     const url = getWebFetchUrl(toolInput);
     return mcpRedirect({
       action: "deny",
@@ -902,7 +911,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     // invoke and stalls (see #724). Prepend the ToolSearch bootstrap for claude-code
     // (the default when platform is unset). Other platforms don't defer, so skip it.
     const isClaudeCode = !platform || platform === "claude-code";
-    const subagentBlock = createRoutingBlock(t, {
+    const subagentBlock = platform === "codex" ? routingBlock : createRoutingBlock(t, {
       includeCommands: false,
       toolSearchBootstrap: isClaudeCode,
     });
@@ -1008,6 +1017,8 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   // payloads flood context unchecked. Re-firing periodically keeps the guidance
   // in the model's recent window without saturating it.
   if (isExternalMcpTool(toolName)) {
+    // Keep event capture and explicit security checks; omit periodic advice.
+    if (platform === "codex") return null;
     const externalMcpGuidance = platform ? createExternalMcpGuidance(t) : EXTERNAL_MCP_GUIDANCE;
     return guidancePeriodic("external-mcp", externalMcpGuidance, sessionId, getExternalMcpNudgeEvery());
   }

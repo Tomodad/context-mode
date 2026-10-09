@@ -6,11 +6,11 @@ import "../ensure-deps.mjs";
  * Codex CLI sessionStart hook for context-mode.
  */
 
-import { createRoutingBlock } from "../routing-block.mjs";
+import { createCodexRoutingBlock } from "../routing-block.mjs";
 import { createToolNamer } from "../core/tool-naming.mjs";
 
 const toolNamer = createToolNamer("codex");
-const ROUTING_BLOCK = createRoutingBlock(toolNamer);
+const ROUTING_BLOCK = createCodexRoutingBlock(toolNamer);
 import {
   writeSessionEventsFile,
   buildSessionDirective,

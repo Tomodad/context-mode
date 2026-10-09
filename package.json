@@ -62,6 +62,7 @@
     "build",
     "hooks",
     "configs",
+    "docs/codex",
     "server.bundle.mjs",
     "cli.bundle.mjs",
     "bin",

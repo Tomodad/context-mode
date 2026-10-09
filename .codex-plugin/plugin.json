@@ -1,7 +1,7 @@
 {
   "name": "context-mode",
   "version": "1.0.169",
-  "description": "MCP server that saves 98% of your context window with session continuity. Sandboxed code execution in 11 languages, FTS5 knowledge base with BM25 ranking, and automatic state restore across compactions.",
+  "description": "On-demand large-file analysis and indexed retrieval, with session continuity. Codex instructions coexist with RTK native Shell hooks.",
   "author": {
     "name": "Mert Koseoğlu",
     "url": "https://github.com/mksglu"
@@ -21,10 +21,10 @@
   ],
   "mcpServers": "./.codex-plugin/mcp.json",
   "hooks": "./.codex-plugin/hooks.json",
-  "skills": "./skills/",
+  "skills": "./.codex-plugin/skills/",
   "interface": {
     "displayName": "context-mode",
-    "shortDescription": "98% context window savings via FTS5 + sandboxed execution",
+    "shortDescription": "On-demand analysis, indexed retrieval, and session continuity",
     "developerName": "Mert Koseoğlu",
     "category": "Productivity"
   }
