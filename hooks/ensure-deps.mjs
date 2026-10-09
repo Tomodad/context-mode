@@ -126,6 +126,7 @@ function probeNativeInChildProcess(pluginRoot) {
         cwd: pluginRoot,
         stdio: "pipe",
         timeout: 10000,
+        windowsHide: true,
       },
     );
     return true;
@@ -217,6 +218,7 @@ export function ensureNativeCompat(pluginRoot) {
         stdio: "pipe",
         timeout: 60000,
         shell: true,
+        windowsHide: true,
         env: envWithRunningNodeFirst(),
       });
       codesignBinary(binaryPath);
@@ -237,6 +239,7 @@ export function ensureNativeCompat(pluginRoot) {
         stdio: "pipe",
         timeout: 60000,
         shell: true,
+        windowsHide: true,
         env: envWithRunningNodeFirst(),
       });
       codesignBinary(binaryPath);
@@ -251,12 +254,14 @@ export function ensureNativeCompat(pluginRoot) {
 
 function envWithRunningNodeFirst() {
   const env = {};
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path");
+  const inheritedPath = process.env.PATH ?? (pathKey ? process.env[pathKey] : "") ?? "";
   // Windows treats environment keys case-insensitively. Remove any existing
   // Path/PATH entry before adding one authoritative value for the child.
   for (const [key, value] of Object.entries(process.env)) {
     if (key.toLowerCase() !== "path") env[key] = value;
   }
-  env.PATH = `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`;
+  env.PATH = `${dirname(process.execPath)}${delimiter}${inheritedPath}`;
   return env;
 }
 
