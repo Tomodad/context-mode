@@ -12,7 +12,7 @@ import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
 import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { walkDirectoryDetailed, type WalkOptions } from "./store-directory.js";
@@ -52,13 +52,10 @@ type SearchContentRow = {
   highlighted: string;
 };
 
-type SearchLocationRow = {
-  content_chars: number;
-  match_pos: number;
-};
-
 type SearchWindowRow = {
-  content: string;
+  excerpt: string;
+  prefix_cut: number;
+  suffix_cut: number;
 };
 
 import type { IndexResult, SearchResult, StoreStats } from "./types.js";
@@ -177,9 +174,9 @@ const MAX_CHUNK_BYTES = 4096;
 // while legacy oversized rows are hydrated as a bounded match window.
 const SEARCH_RESULT_MAX_CHARS = 3000;
 const SEARCH_RESULT_CONTEXT_CHARS = 300;
-const SEARCH_LOCATION_PREFIX_CHARS = 6;
-// Bound extra legacy-row scans for unusually long OR queries.
-const SEARCH_LOCATION_MAX_TERMS = 32;
+const SEARCH_RESULT_SNIPPET_TOKENS = 32;
+// Room for at most two UUID markers per snippet token plus the payload.
+const SEARCH_RESULT_MARKED_MAX_CHARS = SEARCH_RESULT_MAX_CHARS + 4096;
 
 // Blank-line sectioning is used only for output that is *naturally* sectioned:
 // at least a few sections, not an unbounded explosion, and no single section so
@@ -420,8 +417,6 @@ export class ContentStore {
   #stmtSearchTrigramExactContentType!: PreparedStatement;
   #stmtHydratePorter!: PreparedStatement;
   #stmtHydrateTrigram!: PreparedStatement;
-  #stmtLocatePorter!: PreparedStatement;
-  #stmtLocateTrigram!: PreparedStatement;
   #stmtWindowPorter!: PreparedStatement;
   #stmtWindowTrigram!: PreparedStatement;
 
@@ -824,28 +819,27 @@ export class ContentStore {
         AND length(CAST(chunks_trigram.content AS BLOB)) <= ?
     `);
 
-    // Legacy oversized rows use scalar position lookup followed by substr().
-    // Only integer metadata and the bounded window cross the SQLite/JS boundary.
-    this.#stmtLocatePorter = this.#db.prepare(`
-      SELECT
-        length(chunks.content) AS content_chars,
-        instr(lower(chunks.content), ?) AS match_pos
-      FROM chunks
-      WHERE chunks.rowid = ?
+    // FTS5 itself locates the matching token, preserving Porter stemming,
+    // diacritic folding, and OR semantics. A token-count-limited snippet is
+    // NOT byte bounded: one legacy token can be megabytes. Materialize it
+    // inside SQLite and cut around the real highlight marker BEFORE crossing
+    // the SQLite/JS boundary. Normal capped rows keep full historical output.
+    const boundedSnippet = (table: "chunks" | "chunks_trigram") => this.#db.prepare(`
+      WITH excerpt AS MATERIALIZED (
+        SELECT snippet(${table}, 1, ?, ?, '…', ?) AS value
+        FROM ${table}
+        WHERE ${table} MATCH ? AND ${table}.rowid IN (SELECT ?)
+          AND instr(${table}.content, ?) = 0 AND instr(${table}.content, ?) = 0
+      ), located AS (
+        SELECT value, max(1, instr(value, ?) - ?) AS start FROM excerpt
+      )
+      SELECT substr(value, start, ?) AS excerpt,
+        start > 1 AS prefix_cut,
+        start - 1 + ? < length(value) AS suffix_cut
+      FROM located
     `);
-    this.#stmtLocateTrigram = this.#db.prepare(`
-      SELECT
-        length(chunks_trigram.content) AS content_chars,
-        instr(lower(chunks_trigram.content), ?) AS match_pos
-      FROM chunks_trigram
-      WHERE chunks_trigram.rowid = ?
-    `);
-    this.#stmtWindowPorter = this.#db.prepare(
-      "SELECT substr(content, ?, ?) AS content FROM chunks WHERE rowid = ?",
-    );
-    this.#stmtWindowTrigram = this.#db.prepare(
-      "SELECT substr(content, ?, ?) AS content FROM chunks_trigram WHERE rowid = ?",
-    );
+    this.#stmtWindowPorter = boundedSnippet("chunks");
+    this.#stmtWindowTrigram = boundedSnippet("chunks_trigram");
 
     // Fuzzy path
     this.#stmtFuzzyVocab = this.#db.prepare(
@@ -1200,65 +1194,14 @@ export class ContentStore {
 
   // ── Search ──
 
-  #searchLocationNeedles(query: string): Array<{ exact: string; prefix: string }> {
-    const words = dedupeTokens(
-      query
-        .replace(/['"(){}[\]*:^~]/g, " ")
-        .split(/\s+/)
-        .filter(
-          (word) =>
-            word.length > 0 &&
-            !["AND", "OR", "NOT", "NEAR"].includes(word.toUpperCase()),
-        ),
-    );
-    const meaningful = words.filter((word) => !STOPWORDS.has(word.toLowerCase()));
-    return (meaningful.length > 0 ? meaningful : words)
-      .slice(0, SEARCH_LOCATION_MAX_TERMS)
-      .map((word) => {
-        const exact = word.toLowerCase();
-        const exactChars = Array.from(exact);
-        const prefix = exactChars.length > SEARCH_LOCATION_PREFIX_CHARS
-          ? exactChars.slice(0, SEARCH_LOCATION_PREFIX_CHARS).join("")
-          : exact;
-        return { exact, prefix };
-      });
-  }
-
-  #markBoundedMatch(
-    content: string,
-    matchOffset: number,
-    matchLength: number,
-    expandToken: boolean,
-  ): string {
-    const chars = Array.from(content);
-    let start = Math.max(0, matchOffset);
-    let end = Math.min(chars.length, start + matchLength);
-
-    if (expandToken) {
-      const isTokenChar = (char: string) => /[\p{L}\p{N}_]/u.test(char);
-      while (start > 0 && isTokenChar(chars[start - 1])) start--;
-      while (end < chars.length && isTokenChar(chars[end])) end++;
-    }
-
-    return chars.slice(0, start).join("")
-      + "\x02"
-      + chars.slice(start, end).join("")
-      + "\x03"
-      + chars.slice(end).join("");
-  }
-
   #hydrateSearchRow(
     row: SearchRow,
-    query: string,
     ftsQuery: string,
     index: SearchIndex,
   ): SearchResult {
     const hydrateStmt = index === "porter"
       ? this.#stmtHydratePorter
       : this.#stmtHydrateTrigram;
-    const locateStmt = index === "porter"
-      ? this.#stmtLocatePorter
-      : this.#stmtLocateTrigram;
     const windowStmt = index === "porter"
       ? this.#stmtWindowPorter
       : this.#stmtWindowTrigram;
@@ -1275,65 +1218,60 @@ export class ContentStore {
       content = normal.content;
       highlighted = normal.highlighted;
     } else {
-      const needles = this.#searchLocationNeedles(query);
-      let location: SearchLocationRow | undefined;
-      let matchPos = 0;
-      let matchedNeedle = "";
-      let expandToken = false;
+      // Literal STX/ETX bytes can occur in indexed data. Use fresh markers,
+      // verified absent by SQL, rather than mistaking source text for a hit.
+      let window: SearchWindowRow | undefined;
+      let startMarker = "";
+      let endMarker = "";
+      for (let attempt = 0; attempt < 3 && !window; attempt++) {
+        const nonce = randomUUID();
+        startMarker = `\x02${nonce}\x02`;
+        endMarker = `\x03${nonce}\x03`;
+        window = windowStmt.get(
+          startMarker, endMarker, SEARCH_RESULT_SNIPPET_TOKENS,
+          ftsQuery, row.rowid, startMarker, endMarker, startMarker,
+          SEARCH_RESULT_CONTEXT_CHARS,
+          SEARCH_RESULT_MARKED_MAX_CHARS, SEARCH_RESULT_MARKED_MAX_CHARS,
+        ) as SearchWindowRow | undefined;
+      }
+      if (!window) throw new Error("Could not hydrate the ranked FTS row safely");
 
-      // OR results need not contain the first query term. Try the remaining
-      // terms before falling back to a prefix window. Content stays in SQLite.
-      for (const needle of needles) {
-        location = locateStmt.get(needle.exact, row.rowid) as SearchLocationRow | undefined;
-        matchPos = location?.match_pos ?? 0;
-        if (matchPos > 0) {
-          matchedNeedle = needle.exact;
-          break;
+      const parts: string[] = [];
+      const markedParts: string[] = [];
+      let offset = 0;
+      let remaining = SEARCH_RESULT_MAX_CHARS;
+      let open = false;
+      while (offset < window.excerpt.length && remaining > 0) {
+        if (window.excerpt.startsWith(startMarker, offset)) {
+          markedParts.push("\x02");
+          open = true;
+          offset += startMarker.length;
+        } else if (window.excerpt.startsWith(endMarker, offset)) {
+          markedParts.push("\x03");
+          open = false;
+          offset += endMarker.length;
+        } else {
+          const start = window.excerpt.indexOf(startMarker, offset);
+          const end = window.excerpt.indexOf(endMarker, offset);
+          const stop = Math.min(start < 0 ? window.excerpt.length : start,
+            end < 0 ? window.excerpt.length : end);
+          const chars = Array.from(window.excerpt.slice(offset, stop));
+          const segment = chars.slice(0, remaining).join("");
+          parts.push(segment);
+          // Keep raw content verbatim. Only the display/highlight stream
+          // neutralizes literal control delimiters so span parsing is stable.
+          markedParts.push(segment.replace(/[\x02\x03]/g, " "));
+          remaining -= Math.min(chars.length, remaining);
+          offset += segment.length;
         }
       }
-      if (matchPos === 0) {
-        for (const needle of needles) {
-          if (needle.prefix === needle.exact) continue;
-          location = locateStmt.get(needle.prefix, row.rowid) as SearchLocationRow | undefined;
-          matchPos = location?.match_pos ?? 0;
-          if (matchPos > 0) {
-            matchedNeedle = needle.prefix;
-            expandToken = true;
-            break;
-          }
-        }
-      }
+      if (open) markedParts.push("\x03");
+      const prefix = window.prefix_cut ? "…" : "";
+      const remainder = window.excerpt.slice(offset).split(startMarker).join("").split(endMarker).join("");
+      const suffix = window.suffix_cut || remainder.length > 0 ? "…" : "";
+      content = prefix + parts.join("") + suffix;
+      highlighted = prefix + markedParts.join("") + suffix;
 
-      const matchLength = matchPos > 0 ? Array.from(matchedNeedle).length : 0;
-      const windowStart = Math.max(
-        1,
-        (matchPos > 0 ? matchPos : 1) - SEARCH_RESULT_CONTEXT_CHARS,
-      );
-      const window = windowStmt.get(
-        windowStart,
-        SEARCH_RESULT_MAX_CHARS,
-        row.rowid,
-      ) as SearchWindowRow | undefined;
-
-      content = window?.content ?? "";
-      highlighted = matchPos > 0 && matchLength > 0
-        ? this.#markBoundedMatch(
-            content,
-            matchPos - windowStart,
-            matchLength,
-            expandToken,
-          )
-        : content;
-
-      const windowChars = Array.from(content).length;
-      if (windowStart > 1) {
-        content = "…" + content;
-        highlighted = "…" + highlighted;
-      }
-      if (location && windowStart - 1 + windowChars < location.content_chars) {
-        content += "…";
-        highlighted += "…";
-      }
     }
 
     return {
@@ -1354,7 +1292,7 @@ export class ContentStore {
     ftsQuery: string,
     index: SearchIndex,
   ): SearchResult[] {
-    return rows.map((row) => this.#hydrateSearchRow(row, query, ftsQuery, index));
+    return rows.map((row) => this.#hydrateSearchRow(row, ftsQuery, index));
   }
 
   #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {

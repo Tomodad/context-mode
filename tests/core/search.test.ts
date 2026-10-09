@@ -2133,6 +2133,51 @@ describe("Bounded FTS result hydration for legacy oversized rows", () => {
     } finally { store.cleanup(); }
   });
 
+  test.each([
+    ["cat authentication", "concatenate ", "authentication", "OR"],
+    ["running", "prefix ", "run", "AND"],
+    ["cafe", "prefix ", "CAFÉ", "AND"],
+  ] as const)("legacy FTS token semantics: %s", (query, prefix, needle, mode) => {
+    const store = createStoreWithLegacyOversizedRows([{
+      title: "Legacy evidence", source: "legacy-token-semantics",
+      content: prefix + "padding ".repeat(900) + needle + " TARGET",
+    }]);
+    try {
+      const results = store.search(query, 1, "legacy-token-semantics", mode);
+      assert.equal(results.length, 1);
+      assert.ok(results[0].content.includes(needle));
+      assert.ok(results[0].highlighted?.includes(`\x02${needle}\x03`));
+      assert.ok(results[0].content.length <= 3_002);
+    } finally { store.cleanup(); }
+  });
+
+  test("literal highlight-control characters cannot hijack legacy match location", () => {
+    const store = createStoreWithLegacyOversizedRows([{
+      title: "Control character row", source: "legacy-controls",
+      content: "\x02" + "x".repeat(100_000) + " authentication \x03 TARGET",
+    }]);
+    try {
+      const [result] = store.search("authentication", 1, "legacy-controls");
+      assert.ok(result.content.includes("authentication \x03 TARGET"));
+      assert.ok(result.highlighted?.includes("\x02authentication\x03"));
+      assert.ok(result.content.length <= 3_002);
+    } finally { store.cleanup(); }
+  });
+
+  test("a giant matching token stays bounded and has balanced highlight markers", () => {
+    const token = "z".repeat(5_000);
+    const store = createStoreWithLegacyOversizedRows([{
+      title: "Giant token row", source: "legacy-giant-token", content: token + " tail",
+    }]);
+    try {
+      const [result] = store.search(token, 1, "legacy-giant-token");
+      assert.ok(result.content.startsWith("z".repeat(100)));
+      assert.ok(result.content.length <= 3_002);
+      assert.equal((result.highlighted?.match(/\x02/g) ?? []).length, 1);
+      assert.equal((result.highlighted?.match(/\x03/g) ?? []).length, 1);
+    } finally { store.cleanup(); }
+  });
+
   function assertBoundedMatch(
     result: { content: string; highlighted?: string },
     needle: string,
