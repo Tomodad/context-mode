@@ -85,7 +85,8 @@ describe("batch indexed byte and chunk budgets (#961)", () => {
       }),
     );
 
-    expect(plan.generatedChunks).toBeGreaterThan(2);
+    expect(plan.generatedChunks).toBe(2);
+    expect(plan.generatedChunks).toBeLessThanOrEqual(plan.policy.maxGeneratedChunks);
     expect(plan.indexedChunks).toBe(2);
     expect(plan.droppedChunks).toBeGreaterThan(0);
     expect(plan.triggeredBudgets).toContain("max_generated_chunks");
@@ -101,7 +102,8 @@ describe("batch indexed byte and chunk budgets (#961)", () => {
     expect(plan.status).toBe("partial");
     expect(plan.commands[0].status).toBe("complete");
     expect(plan.commands[1].status).toBe("not_indexed");
-    expect(plan.generatedChunks).toBe(2);
+    expect(plan.generatedChunks).toBe(1);
+    expect(plan.generatedChunks).toBeLessThanOrEqual(plan.policy.maxGeneratedChunks);
     expect(plan.indexedChunks).toBe(1);
     expect(plan.droppedChunks).toBe(1);
     expect(plan.triggeredBudgets).toContain("max_generated_chunks");
@@ -300,7 +302,7 @@ describe("batch indexed byte and chunk budgets (#961)", () => {
     expect(result.commands[0].durationMs).toBeGreaterThanOrEqual(0);
   });
 
-  test("ctx_batch_execute schema and handler expose budget controls and structured metrics", () => {
+  test("ctx_batch_execute schema exposes budget controls", () => {
     const serverSource = readFileSync(new URL("../src/server.ts", import.meta.url), "utf8");
 
     expect(serverSource).toContain("max_bytes_per_command");

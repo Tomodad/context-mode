@@ -102,6 +102,8 @@ interface CandidateChunk {
  * - 4,608 chunks admits an exact 16 MiB batch (4,158 measured chunks) while
  *   still truncating the 5,000-section explosion case.
  */
+export const DEFAULT_BATCH_SECTION_INVENTORY_LIMIT = 50;
+
 export const DEFAULT_BATCH_INGESTION_LIMITS: BatchIngestionLimits = {
   maxBytesPerCommand: 8 * 1024 * 1024,
   maxTotalIndexedBytes: 16 * 1024 * 1024,
@@ -268,23 +270,32 @@ function* chunkStream(
   stream: BatchOutputStream,
   body: string,
   maxChunkBytes: number,
-): Generator<CandidateChunk> {
+  maxGeneratedChunks: number,
+): Generator<CandidateChunk, number> {
+  let generated = 0;
+  let dropped = 0;
+
   if (body.length === 0) {
     const header = buildChunkHeader(command, stream, 1);
     const contentBytes = Buffer.byteLength(header, "utf8");
     if (contentBytes > maxChunkBytes) {
       throw new Error(`Batch chunk metadata exceeds max_chunk_bytes for command ${command.label}`);
     }
-    yield {
-      title: buildChunkTitle(command, stream, 1),
-      header,
-      body: "",
-      bodyBytes: 0,
-      contentBytes,
-      stream,
-      part: 1,
-    };
-    return;
+    if (generated < maxGeneratedChunks) {
+      generated += 1;
+      yield {
+        title: buildChunkTitle(command, stream, 1),
+        header,
+        body: "",
+        bodyBytes: 0,
+        contentBytes,
+        stream,
+        part: 1,
+      };
+    } else {
+      dropped += 1;
+    }
+    return dropped;
   }
 
   let part = 1;
@@ -301,18 +312,24 @@ function* chunkStream(
     if (slice.end <= offset) {
       throw new Error(`max_chunk_bytes cannot fit one UTF-8 code point for command ${command.label}`);
     }
-    yield {
-      title: buildChunkTitle(command, stream, part),
-      header,
-      body: slice.text,
-      bodyBytes: slice.bytes,
-      contentBytes: headerBytes + slice.bytes,
-      stream,
-      part,
-    };
+    if (generated < maxGeneratedChunks) {
+      generated += 1;
+      yield {
+        title: buildChunkTitle(command, stream, part),
+        header,
+        body: slice.text,
+        bodyBytes: slice.bytes,
+        contentBytes: headerBytes + slice.bytes,
+        stream,
+        part,
+      };
+    } else {
+      dropped += 1;
+    }
     offset = slice.end;
     part += 1;
   }
+  return dropped;
 }
 
 function addTriggers(target: Set<BatchBudgetTrigger>, source: Iterable<BatchBudgetTrigger>): void {
@@ -369,19 +386,20 @@ export function planBatchIngestion(
     const commandTriggers = new Set<BatchBudgetTrigger>();
 
     for (const [stream, body] of orderedStreams(command)) {
-      for (const candidate of chunkStream(command, stream, body, policy.maxChunkBytes)) {
+      const generationCapacity = Math.max(0, policy.maxGeneratedChunks - generatedChunks);
+      const iterator = chunkStream(
+        command,
+        stream,
+        body,
+        policy.maxChunkBytes,
+        generationCapacity,
+      );
+      let result = iterator.next();
+      while (!result.done) {
+        const candidate = result.value;
         generatedChunks += 1;
         commandGeneratedChunks += 1;
         maxBufferedChunkBytes = Math.max(maxBufferedChunkBytes, candidate.contentBytes);
-
-        const hasChunkCapacity = indexedChunks < policy.maxGeneratedChunks;
-        if (!hasChunkCapacity) {
-          droppedChunks += 1;
-          commandDroppedChunks += 1;
-          commandTriggers.add("max_generated_chunks");
-          batchTriggers.add("max_generated_chunks");
-          continue;
-        }
 
         const commandRemainingBefore = commandRemaining;
         const batchRemainingBefore = batchRemaining;
@@ -442,9 +460,17 @@ export function planBatchIngestion(
             batchTriggers.add("batch_bytes");
           }
         }
+        result = iterator.next();
+      }
+
+      const generationDropped = result.value;
+      if (generationDropped > 0) {
+        droppedChunks += generationDropped;
+        commandDroppedChunks += generationDropped;
+        commandTriggers.add("max_generated_chunks");
+        batchTriggers.add("max_generated_chunks");
       }
     }
-
     const commandDroppedBytes = commandCapturedBytes - commandIndexedBytes;
     const commandStatus = statusFor(
       commandCapturedBytes,
@@ -507,6 +533,40 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024).toFixed(1)} KiB`;
 }
 
+function formatCount(value: number): string {
+  return value.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+export function formatBatchSectionInventory(
+  chunks: readonly BatchPreparedChunk[],
+  totalChunks: number,
+  limit: number = DEFAULT_BATCH_SECTION_INVENTORY_LIMIT,
+): string[] {
+  assertPositiveInteger("batch_inventory_display_limit", limit);
+  if (!Number.isSafeInteger(totalChunks) || totalChunks < 0) {
+    throw new Error("total_chunks must be a non-negative safe integer");
+  }
+
+  const displayed = Math.min(limit, totalChunks, chunks.length);
+  const lines = ["## Indexed Sections", ""];
+  for (let index = 0; index < displayed; index++) {
+    const chunk = chunks[index];
+    const bytes = Buffer.byteLength(chunk.content, "utf8");
+    lines.push(`- ${chunk.title} (${(bytes / 1024).toFixed(1)}KB)`);
+  }
+
+  lines.push("");
+  if (displayed < totalChunks) {
+    lines.push(
+      `Showing ${formatCount(displayed)} of ${formatCount(totalChunks)} sections; ` +
+      `${formatCount(totalChunks - displayed)} omitted.`,
+    );
+  } else {
+    lines.push(`Showing all ${formatCount(totalChunks)} sections.`);
+  }
+  return lines;
+}
+
 export function formatBatchIngestionSummary(plan: BatchIngestionPlan): string[] {
   const triggered = plan.triggeredBudgets.length > 0
     ? plan.triggeredBudgets.join(", ")
@@ -533,7 +593,7 @@ export function formatBatchIngestionSummary(plan: BatchIngestionPlan): string[] 
       ? command.triggeredBudgets.join(",")
       : "none";
     lines.push(
-      `- ${command.label}: ${displayStatus(command.status)}; exit=${command.exitCode}; duration=${Math.max(0, Math.round(command.durationMs))}ms; indexed=${command.indexedBytes}B; dropped=${command.droppedBytes}B; chunks=${command.indexedChunks}/${command.generatedChunks}; budgets=${commandTriggered}`,
+      `- ${command.label}: ${displayStatus(command.status)}; exit=${command.exitCode}; duration=${Math.max(0, Math.round(command.durationMs))}ms; indexed=${command.indexedBytes}B; dropped=${command.droppedBytes}B; chunks=generated:${command.generatedChunks},indexed:${command.indexedChunks},dropped:${command.droppedChunks}; budgets=${commandTriggered}`,
     );
   }
 
