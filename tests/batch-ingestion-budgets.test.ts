@@ -42,6 +42,16 @@ function limits(overrides: Partial<BatchIngestionLimits> = {}): BatchIngestionLi
 }
 
 describe("batch indexed byte and chunk budgets (#961)", () => {
+  test("metadata truncation does not split astral characters in chunk titles", () => {
+    const label = "a".repeat(145) + "🤖" + "b".repeat(20);
+    const plan = planBatchIngestion([command(label, "evidence")], DEFAULT_BATCH_INGESTION_LIMITS);
+    expect(plan.chunks.length).toBeGreaterThan(0);
+    for (const chunk of plan.chunks) {
+      for (const text of [chunk.title, chunk.content]) {
+        expect(Buffer.from(text, "utf8").toString("utf8")).toBe(text);
+      }
+    }
+  });
   test("uses benchmark-selected default limits", () => {
     expect(DEFAULT_BATCH_INGESTION_LIMITS).toEqual({
       maxBytesPerCommand: 8 * MiB,

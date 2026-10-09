@@ -1,4 +1,5 @@
 import type { PreparedIndexChunkInput } from "./store.js";
+import { charSafePrefix } from "./truncate.js";
 
 export type BatchIndexStatus = "complete" | "partial" | "not_indexed";
 export type BatchBudgetTrigger =
@@ -187,7 +188,7 @@ function normalizePolicy(
 
 function truncateMetadata(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
-  return `${value.slice(0, Math.max(0, maxChars - 14))}...[truncated]`;
+  return `${charSafePrefix(value, Math.max(0, maxChars - 14))}...[truncated]`;
 }
 
 function jsonMetadata(value: string, maxChars: number): string {

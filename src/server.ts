@@ -1624,7 +1624,7 @@ function buildBatchSource(commands: readonly BatchCommand[]): string {
   let source = "batch:";
   for (let index = 0; index < commands.length && source.length < 80; index++) {
     const prefix = index === 0 ? "" : ",";
-    source += `${prefix}${commands[index].label}`.slice(0, 80 - source.length);
+    source += charSafePrefix(`${prefix}${commands[index].label}`, 80 - source.length);
   }
   return source;
 }

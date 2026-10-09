@@ -44,7 +44,8 @@ test("ctx_batch_execute bounds its real MCP response for a multi-thousand-chunk 
       name: "ctx_batch_execute",
       arguments: {
         commands: [{
-          label: "oversized-command",
+          // Split points exercise both the 80-char source and metadata caps.
+          label: "a".repeat(73) + "🤖" + "b".repeat(70) + "😀" + "c".repeat(30),
           command: "node -e \"process.stdout.write('" + marker + "\\n' + 'x'.repeat(" + (9 * MiB) + "))\"",
         }],
         queries: [marker],
@@ -86,6 +87,7 @@ test("ctx_batch_execute bounds its real MCP response for a multi-thousand-chunk 
       .filter((line) => /^- .+ \(\d+\.\dKB\)$/.test(line));
     expect(displayedRows).toHaveLength(50);
     expect(Buffer.byteLength(text, "utf8")).toBeLessThan(64 * 1024);
+    expect(Buffer.from(text, "utf8").toString("utf8")).toBe(text);
   } finally {
     await client.close();
     await server.server.close();
