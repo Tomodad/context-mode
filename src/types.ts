@@ -60,6 +60,7 @@ export interface ExecResult {
   stderr: string;
   exitCode: number;
   timedOut: boolean;
+  cancelled?: boolean;
   /** Process was detached and continues running in the background. */
   backgrounded?: boolean;
 }

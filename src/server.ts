@@ -154,10 +154,12 @@ export const server = new McpServer({
   version: VERSION,
 });
 
+interface ToolRequestExtra { signal?: AbortSignal; }
+
 export interface RegisteredCtxTool {
   name: string;
   config: Record<string, unknown>;
-  handler: (args: Record<string, unknown>) => Promise<unknown> | unknown;
+  handler: (args: Record<string, unknown>, extra?: ToolRequestExtra) => Promise<unknown> | unknown;
 }
 
 export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = [];
@@ -288,7 +290,7 @@ const originalRegisterTool = server.registerTool.bind(server);
   const [name, config, handler] = args as [
     string,
     Record<string, unknown>,
-    (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
+    (toolArgs: Record<string, unknown>, extra?: ToolRequestExtra) => Promise<unknown> | unknown,
   ];
   if (suppressMcpToolsForNativePluginHost) {
     emitSuppressionDiagnostic();
@@ -302,15 +304,16 @@ const originalRegisterTool = server.registerTool.bind(server);
 
 function wrapToolHandler(
   name: string,
-  handler: (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
-): (toolArgs: Record<string, unknown>) => Promise<unknown> {
-  return async (toolArgs: Record<string, unknown>) => {
+  handler: (toolArgs: Record<string, unknown>, extra?: ToolRequestExtra) => Promise<unknown> | unknown,
+): (toolArgs: Record<string, unknown>, extra?: ToolRequestExtra) => Promise<unknown> {
+  return async (toolArgs: Record<string, unknown>, extra?: ToolRequestExtra) => {
     // #854: mark a tool call in-flight so the bridge-child idle reaper never
     // shuts the server down mid-execution during a long ctx_execute/batch that
     // emits no further inbound messages. Symmetric end in finally (success+error).
     noteRequestStart();
     try {
-      return await handler(toolArgs);
+      extra?.signal?.throwIfAborted();
+      return await handler(toolArgs, extra);
     } catch (err) {
       const result = storageErrorResult(err);
       if (result) {
@@ -1449,13 +1452,14 @@ export interface BatchRunOptions {
   concurrency: number;
   nodeOptsPrefix: string;
   cwd?: string;
+  signal?: AbortSignal;
   onFsBytes?: (bytes: number) => void;
   /** Preserve the legacy display-Markdown output array for existing callers. */
   includeDisplayOutputs?: boolean;
 }
 
 interface BatchExecutor {
-  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }): Promise<{
+  execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string; signal?: AbortSignal }): Promise<{
     stdout: string;
     stderr?: string;
     exitCode?: number;
@@ -1648,7 +1652,9 @@ export async function runBatchCommands(
     cwd,
     onFsBytes,
     includeDisplayOutputs = true,
+    signal,
   } = opts;
+  signal?.throwIfAborted();
 
   if (concurrency <= 1) {
     const outputs: string[] = [];
@@ -1656,6 +1662,7 @@ export async function runBatchCommands(
     const startTime = Date.now();
     let timedOut = false;
     for (let i = 0; i < commands.length; i++) {
+      signal?.throwIfAborted();
       const cmd = commands[i];
       let perCmdTimeout: number | undefined;
       if (timeout !== undefined) {
@@ -1676,7 +1683,9 @@ export async function runBatchCommands(
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout: perCmdTimeout,
         cwd,
+        signal,
       });
+      signal?.throwIfAborted();
       const captured = captureBatchCommand(
         cmd,
         result,
@@ -1700,13 +1709,16 @@ export async function runBatchCommands(
 
   const jobs: PoolJob<BatchCapturedCommand>[] = commands.map((cmd) => ({
     run: async () => {
+      signal?.throwIfAborted();
       const commandStart = Date.now();
       const result = await executor.execute({
         language: "shell",
         code: `${nodeOptsPrefix}${cmd.command}`,
         timeout,
         cwd,
+        signal,
       });
+      signal?.throwIfAborted();
       return captureBatchCommand(
         cmd,
         result,
@@ -1717,6 +1729,7 @@ export async function runBatchCommands(
   }));
 
   const { settled } = await runPool(jobs, { concurrency });
+  signal?.throwIfAborted();
   const outputs: string[] = includeDisplayOutputs ? new Array(commands.length) : [];
   const capturedCommands: BatchCapturedCommand[] = new Array(commands.length);
   let timedOut = false;
@@ -1850,7 +1863,9 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
         ),
     }),
   },
-  async ({ language, code, timeout, background, cwd, intent }) => {
+  async ({ language, code, timeout, background, cwd, intent }, extra) => {
+    const signal = extra?.signal;
+    signal?.throwIfAborted();
     // Security: deny-only firewall
     if (language === "shell") {
       const denied = checkDenyPolicy(code, "execute");
@@ -1929,7 +1944,8 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
 })(typeof require!=='undefined'?require:null);`;
       }
       const effTimeout = resolveExecTimeout(timeout);
-      const result = await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd });
+      const result = await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd, signal });
+      signal?.throwIfAborted();
 
       // Echo the executed source code before stdout so users can audit
       // and tooling can block command patterns (Issues #717 + #736).
@@ -2221,7 +2237,9 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         ),
     }),
   },
-  async ({ path, language, code, timeout, intent }) => {
+  async ({ path, language, code, timeout, intent }, extra) => {
+    const signal = extra?.signal;
+    signal?.throwIfAborted();
     // Security (#852): confine the processed file to the project root so
     // ctx_execute_file cannot be used to escape the host's sandbox/permission
     // controls. Runs before the deny-glob check — boundary first, then policy.
@@ -2248,7 +2266,9 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         language,
         code,
         timeout: effTimeout,
+        signal,
       });
+      signal?.throwIfAborted();
 
       // Echo path + executed source code before stdout for audit/debug
       // (Issues #717 + #736).
@@ -3922,7 +3942,9 @@ async ({
     max_total_indexed_bytes,
     max_generated_chunks,
     allow_large_ingestion,
-  }) => {
+  }, extra) => {
+    const signal = extra?.signal;
+    signal?.throwIfAborted();
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
       if (denied) return denied;
@@ -3949,10 +3971,12 @@ async ({
           cwd,
           onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
           includeDisplayOutputs: false,
+          signal,
         },
         executor,
       );
 
+      signal?.throwIfAborted();
       if (timedOut && capturedCommands.length === 0) {
         return trackResponse("ctx_batch_execute", {
           content: [

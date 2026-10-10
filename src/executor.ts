@@ -197,7 +197,7 @@ function cleanupTmpDir(tmpDir: string): void {
 function killTree(proc: ReturnType<typeof spawn>): void {
   if (isWin && proc.pid) {
     try {
-      execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: "pipe" });
+      execFileSync(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID", String(proc.pid)], { stdio: "pipe", windowsHide: true, timeout: 5000 });
     } catch { /* already dead */ }
   } else if (proc.pid) {
     try {
@@ -222,6 +222,7 @@ interface ExecuteOptions {
    * a non-project cwd (e.g. $HOME).
    */
   cwd?: string;
+  signal?: AbortSignal;
 }
 
 interface ExecuteFileOptions extends ExecuteOptions {
@@ -280,7 +281,8 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout, background = false, cwd: cwdOverride } = opts;
+    const { language, code, timeout, background = false, cwd: cwdOverride, signal } = opts;
+    signal?.throwIfAborted();
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -289,7 +291,7 @@ export class PolyglotExecutor {
 
       // Rust: compile then run
       if (cmd[0] === "__rust_compile_run__") {
-        return await this.#compileAndRun(filePath, tmpDir, timeout);
+        return await this.#compileAndRun(filePath, tmpDir, timeout, signal);
       }
 
       // Every language runs in the project directory so git, relative paths,
@@ -304,7 +306,7 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background);
+      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, signal);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
@@ -319,14 +321,15 @@ export class PolyglotExecutor {
   }
 
   async executeFile(opts: ExecuteFileOptions): Promise<ExecResult> {
-    const { path: filePath, language, code, timeout } = opts;
+    const { path: filePath, language, code, timeout, signal } = opts;
+    signal?.throwIfAborted();
     const absolutePath = resolve(this.#projectRoot, filePath);
     const wrappedCode = this.#wrapWithFileContent(
       absolutePath,
       language,
       code,
     );
-    return this.execute({ language, code: wrappedCode, timeout });
+    return this.execute({ language, code: wrappedCode, timeout, signal });
   }
 
   #writeScript(tmpDir: string, code: string, language: Language): string {
@@ -378,6 +381,7 @@ export class PolyglotExecutor {
     srcPath: string,
     cwd: string,
     timeout: number | undefined,
+    signal?: AbortSignal,
   ): Promise<ExecResult> {
     const binSuffix = isWin ? ".exe" : "";
     const binPath = srcPath.replace(/\.rs$/, "") + binSuffix;
@@ -403,7 +407,8 @@ export class PolyglotExecutor {
     }
 
     // Run
-    return this.#spawn([binPath], cwd, cwd, timeout);
+    signal?.throwIfAborted();
+    return this.#spawn([binPath], cwd, cwd, timeout, false, signal);
   }
 
   async #spawn(
@@ -412,7 +417,9 @@ export class PolyglotExecutor {
     sandboxTmpDir: string,
     timeout: number | undefined,
     background = false,
+    signal?: AbortSignal,
   ): Promise<ExecResult> {
+    signal?.throwIfAborted();
     return new Promise((res) => {
       // Only .cmd/.bat shims need shell on Windows; real executables don't.
       // Using shell: true globally causes process-tree kill issues with MSYS2/Git Bash.
@@ -467,6 +474,26 @@ export class PolyglotExecutor {
 
       let timedOut = false;
       let resolved = false;
+      let cancelled = false;
+      let settleTimer: NodeJS.Timeout | undefined;
+      const removeAbort = () => signal?.removeEventListener("abort", onAbort);
+      const stop = () => {
+        if (resolved || settleTimer) return;
+        killTree(proc);
+        settleTimer = setTimeout(() => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timer);
+          removeAbort();
+          proc.stdout?.destroy(); proc.stderr?.destroy();
+          proc.unref();
+          res({ stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
+            stderr: Buffer.concat(stderrChunks).toString("utf-8") + "\n[termination grace expired]",
+            exitCode: 1, timedOut, cancelled });
+        }, 1500);
+      };
+      const onAbort = () => { cancelled = true; stop(); };
+      signal?.addEventListener("abort", onAbort, { once: true });
       // Issue #406 — if the caller didn't pass a timeout we don't fire one.
       // Timeout policy belongs to the MCP host/client (Claude Code, VSCode,
       // JetBrains all enforce their own RPC timeouts); imposing a second
@@ -477,6 +504,7 @@ export class PolyglotExecutor {
         if (background) {
           // Background mode: detach process, return partial output, keep running
           resolved = true;
+          removeAbort();
           if (proc.pid) this.#backgroundedPids.add(proc.pid);
           proc.unref();
           // Do NOT destroy stdout/stderr — closing the read end of the pipe
@@ -503,9 +531,10 @@ export class PolyglotExecutor {
             backgrounded: true,
           });
         } else {
-          killTree(proc);
+          stop();
         }
       }, timeout);
+      if (signal?.aborted) onAbort();
 
       // Stream-level byte cap: kill the process once combined stdout+stderr
       // exceeds hardCapBytes. Without this, a command like `yes` or
@@ -538,7 +567,10 @@ export class PolyglotExecutor {
 
       proc.on("close", (exitCode) => {
         clearTimeout(timer);
+        clearTimeout(settleTimer);
+        removeAbort();
         if (resolved) return; // Already resolved by background timeout
+        resolved = true;
         const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
         let rawStderr = Buffer.concat(stderrChunks).toString("utf-8");
 
@@ -552,14 +584,18 @@ export class PolyglotExecutor {
         res({
           stdout,
           stderr,
-          exitCode: timedOut ? 1 : (exitCode ?? 1),
+          exitCode: timedOut || cancelled ? 1 : (exitCode ?? 1),
           timedOut,
+          cancelled,
         });
       });
 
       proc.on("error", (err) => {
         clearTimeout(timer);
+        clearTimeout(settleTimer);
+        removeAbort();
         if (resolved) return; // Already resolved by background timeout
+        resolved = true;
         res({
           stdout: "",
           stderr: err.message,
