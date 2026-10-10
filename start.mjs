@@ -606,6 +606,11 @@ if (!process.env.VITEST) {
 }
 
 // Bundle exists (CI-built) — start instantly
+if (process.platform === 'win32') {
+  const { prepareWindowsJobHelper } = await import('./hooks/windows-owned-process.mjs');
+  // A read-only/missing framework cache keeps the original fully owned path.
+  await prepareWindowsJobHelper();
+}
 if (existsSync(resolve(__dirname, "server.bundle.mjs"))) {
   await import("./server.bundle.mjs");
 } else {

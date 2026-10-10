@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+export function prepareWindowsJobHelper(): Promise<boolean>;
 export function spawnWindowsOwned(command: string, args: string[], options: {
   cwd: string; env: Record<string,string>; shell?: boolean; jobName?: string;
   terminateDescendantsOnRootExit?: boolean;

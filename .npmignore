@@ -14,3 +14,4 @@ tasks/
 .github/
 .DS_Store
 *.db
+hooks/.windows-job-cache/

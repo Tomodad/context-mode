@@ -6,7 +6,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { runWindowsRepair } from '../../hooks/windows-repair.mjs';
 const repo=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
-const base=path.resolve(process.argv[2]), dependencies=path.resolve(process.argv[3]), output=process.argv[4], bun=process.argv[5] ? path.resolve(process.argv[5]) : undefined;
+const base=path.resolve(process.argv[2]), dependencies=path.resolve(process.argv[3]), output=process.argv[4], bun=process.argv[5] && process.argv[5]!=='--cached' ? path.resolve(process.argv[5]) : undefined;
+const useCache=process.argv.includes('--cached');
+async function prepare(root) { if(useCache){const m=await import(pathToFileURL(path.join(root,'hooks/windows-owned-process.mjs')));if(!await m.prepareWindowsJobHelper())throw Error('cached helper preparation failed')} }
 fs.mkdirSync(base,{recursive:true});
 const rows=[],wait=ms=>new Promise(r=>setTimeout(r,ms));
 const alive=pid=>{try{process.kill(pid,0);return true}catch{return false}};
@@ -22,6 +24,7 @@ function fixture(name){
 }
 function observe(proc){let stdout='',stderr='';proc.stdout?.on('data',b=>stdout+=b);proc.stderr?.on('data',b=>stderr+=b);return new Promise(resolve=>proc.once('close',code=>resolve({code,stdout,stderr})))}
 const root=fixture('host-crash'), native=path.join(root,'node_modules/better-sqlite3/build/Release'), binary=path.join(native,'better_sqlite3.node'), backup=path.join(root,'known-good.node');fs.copyFileSync(binary,backup);
+await prepare(root);
 for(const file of fs.readdirSync(native))if(file.startsWith('better_sqlite3'))fs.unlinkSync(path.join(native,file));
 const prebuild=path.join(root,'node_modules/prebuild-install');fs.mkdirSync(prebuild);fs.writeFileSync(path.join(prebuild,'package.json'),'{"name":"prebuild-install","main":"bin.js"}');
 const marker=path.join(root,'installer.json'), writes=path.join(root,'installer-writes.log');
@@ -42,6 +45,7 @@ let recovered;for(let i=0;i<20;i++){recovered=await runWindowsRepair(root);if(re
 check('crashed repair retries only after old Job ends and native loads',recovered.status==='success'&&!alive(installer)&&fs.existsSync(binary),{recovered,oldInstallerAlive:alive(installer)});
 for(const [name,runtime] of [['node',process.execPath],...(bun?[['bun',bun]]:[])]) {
  const failedRoot=fixture(name+'-js-failure'), log=path.join(failedRoot,'install-attempts.log'), ensure=path.join(failedRoot,'hooks/ensure-deps.mjs');
+ await prepare(failedRoot);
  let source=fs.readFileSync(ensure,'utf8').replace('import { execFileSync, execSync } from "node:child_process";','const execFileSync = (...args) => { writeFileSync('+JSON.stringify(log)+', "attempt\\n", {flag:"a"}); throw Error("controlled installer failure"); }; const execSync = execFileSync;');
  fs.writeFileSync(ensure,source);
  const code=`import {runWindowsRepair} from ${JSON.stringify(pathToFileURL(path.join(failedRoot,'hooks/windows-repair.mjs')).href)};console.log(JSON.stringify(await runWindowsRepair(${JSON.stringify(failedRoot)},{startupDeps:true})));`;
@@ -50,9 +54,10 @@ for(const [name,runtime] of [['node',process.execPath],...(bun?[['bun',bun]]:[])
  check(name+' pure-JS install failure enters backoff and never reports success',first.stdout.includes('"status":"failure"')&&second.stdout.includes('"status":"backoff"')&&attempts===3&&after===attempts,{first,second,attempts,after});
 }
 if(bun){const seeded=fixture('bun-cache-seed'),dir=path.join(seeded,'node_modules/better-sqlite3/build/Release');for(const file of fs.readdirSync(dir))if(file.includes('.abi')||file.endsWith('.swap-stamp'))fs.unlinkSync(path.join(dir,file));
+ await prepare(seeded);
  const code=`await import(${JSON.stringify(pathToFileURL(path.join(seeded,'hooks/ensure-deps.mjs')).href)});console.log('SEEDED');`;
  const result=await observe(spawn(bun,['--input-type=module','-e',code],{cwd:seeded,windowsHide:true,stdio:['ignore','pipe','pipe']}));
  check('Bun cache seeding stays in owned worker',result.code===0&&fs.readdirSync(dir).some(file=>file.includes('.abi')),{result,files:fs.readdirSync(dir)});
 }
-const record={node:process.version,abi:process.versions.modules,base,dependencies,installerPayload:'synthetic; production heal code and real child process chain',rows,passed:rows.every(row=>row.passed)};
+const record={node:process.version,abi:process.versions.modules,base,dependencies,helperCache:useCache,installerPayload:'synthetic; production heal code and real child process chain',rows,passed:rows.every(row=>row.passed)};
 fs.writeFileSync(output,JSON.stringify(record,null,2));console.log(JSON.stringify({cases:rows.length,passed:record.passed}));process.exitCode=record.passed?0:1;

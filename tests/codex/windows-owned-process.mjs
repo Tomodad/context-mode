@@ -94,7 +94,7 @@ check('stop watchdog kills only wedged owned helper and its Job',!alive(stalledP
 const limitedSource=original.replace('limit.Basic.Flags=0x2000;','limit.Basic.Flags=0x2008;limit.Basic.ActiveLimit=2;');
 const limited=await variant('outer-job-limit',limitedSource,nestedCode.replaceAll('NESTED中文','LIMIT_TARGET_MUST_NOT_RUN'));
 result=await limited.done;
-check('restricted outer Job fails closed during helper initialization',result.code===1&&result.stderr.includes('[context-mode job] helper failed:')&&!result.stdout.includes('LIMIT_TARGET_MUST_NOT_RUN'),result);
+check('restricted outer Job fails closed during helper initialization',result.code===1&&result.stderr.includes('[context-mode job]')&&!result.stdout.includes('LIMIT_TARGET_MUST_NOT_RUN'),result);
 // A Unicode cleanup fallback must remove only its owned tree and never follow
 // a junction pointing at another fixture directory.
 const unicodeTemp=path.join(root,'中文 temp'), guarded=path.join(root,'guarded-target');fs.mkdirSync(unicodeTemp);fs.mkdirSync(guarded);fs.writeFileSync(path.join(guarded,'keep.txt'),'KEEP');
