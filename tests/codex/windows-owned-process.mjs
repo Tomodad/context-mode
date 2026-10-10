@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { spawnWindowsOwned, stopWindowsOwned, repairJobName } from '../../hooks/windows-owned-process.mjs';
+import { createHash } from 'node:crypto';
+import { spawnWindowsOwned, stopWindowsOwned, repairJobName, waitWindowsOwned } from '../../hooks/windows-owned-process.mjs';
 import { PolyglotExecutor } from '../../build/executor.js';
 if (process.platform !== 'win32') throw Error('Windows-only test');
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -73,8 +74,13 @@ check('nested host Job compatibility',result.code===37&&result.stdout.includes('
 const original=fs.readFileSync(path.join(repo,'hooks/windows-process-job.cs'),'utf8');
 async function variant(name,source,code) {
  const dir=path.join(root,name);fs.mkdirSync(path.join(dir,'hooks'),{recursive:true});
- for(const file of ['windows-owned-process.mjs','windows-process-job.ps1'])fs.copyFileSync(path.join(repo,'hooks',file),path.join(dir,'hooks',file));
+ for(const file of ['windows-owned-process.mjs','windows-process-job.ps1','windows-job-entry.cs'])fs.copyFileSync(path.join(repo,'hooks',file),path.join(dir,'hooks',file));
  fs.writeFileSync(path.join(dir,'hooks/windows-process-job.cs'),source);
+ const hooks=path.join(dir,'hooks'),framework=path.join(process.env.SystemRoot,'Microsoft.NET','Framework64','v4.0.30319');
+ const compiler=spawnWindowsOwned(path.join(framework,'csc.exe'),['/nologo','/noconfig','/nostdlib+','/target:exe','/out:'+path.join(hooks,'windows-job-runtime.exe'),'/reference:'+path.join(framework,'mscorlib.dll'),'/reference:'+path.join(framework,'System.dll'),path.join(hooks,'windows-process-job.cs'),path.join(hooks,'windows-job-entry.cs')],{cwd:hooks,env:process.env,terminateDescendantsOnRootExit:true});
+ compiler.stdout.resume();compiler.stderr.resume();const built=await waitWindowsOwned(compiler,{timeoutMs:15000});if(built.code!==0)throw Error('owned fixture compile failed');
+ const sha=b=>createHash('sha256').update(b).digest('hex'),bytes=fs.readFileSync(path.join(hooks,'windows-job-runtime.exe'));
+ fs.writeFileSync(path.join(hooks,'windows-job-runtime.json'),JSON.stringify({protocol:'CMJ1',sources:Object.fromEntries(['windows-process-job.cs','windows-job-entry.cs'].map(f=>[f,sha(Buffer.from(fs.readFileSync(path.join(hooks,f),'utf8').replaceAll('\r\n','\n')))])),sha256:sha(bytes),bytes:bytes.length}));
  const wrapper=await import(pathToFileURL(path.join(dir,'hooks/windows-owned-process.mjs')).href);
  return observe(wrapper.spawnWindowsOwned(process.execPath,['-e',code],{cwd:root,env:process.env}));
 }

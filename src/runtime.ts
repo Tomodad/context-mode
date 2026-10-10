@@ -1,5 +1,11 @@
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
+// Raw helper is shipped beside all bundles and builds.
+// @ts-ignore -- release-owned raw JS module
+import { spawnWindowsOwned, waitWindowsOwned } from "../hooks/windows-owned-process.mjs";
+// @ts-ignore -- singleton is shared by raw start and bundled server
+import { beginWindowsStartupBudget, windowsStartupBudget } from "../hooks/windows-startup-budget.mjs";
 import { JS_RUNTIMES } from "./adapters/types.js";
 
 /**
@@ -74,11 +80,46 @@ export interface RuntimeMap {
 }
 
 const isWindows = process.platform === "win32";
+function windowsWhere(cmd: string): string {
+  const budget=windowsStartupBudget();
+  execFileSync(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "where.exe"), [cmd], {
+    stdio:"pipe",windowsHide:true,timeout:budget?.remaining(2000) ?? 2000,
+  });
+  // where.exe pipe output uses the OEM code page, not UTF-8. Resolve matches
+  // from Unicode cwd/PATH with Node filesystem APIs instead of corrupting
+  // Chinese paths by decoding those bytes as UTF-8.
+  const pathValue=process.env.PATH ?? Object.entries(process.env).find(([key])=>key.toLowerCase()==='path')?.[1] ?? '';
+  const extensions=(process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
+  const suffixes=/\.[^\\/.]+$/.test(cmd)?['']:['',...extensions];
+  const hits: string[]=[];
+  for(const folder of [process.cwd(),...pathValue.split(';').map(p=>p.replace(/^"|"$/g,''))]) {
+    budget?.assert();
+    if(!folder) continue;
+    for(const suffix of suffixes) {
+      budget?.assert();
+      const file=resolve(folder,cmd+suffix);
+      try {if(statSync(file).isFile()&&!hits.some(hit=>hit.toLowerCase()===file.toLowerCase())) hits.push(file);} catch { /* absent or inaccessible PATH entry */ }
+    }
+  }
+  return hits.join('\n');
+}
+async function windowsVersion(cmd: string, args=["--version"]): Promise<string | null> {
+  const budget=windowsStartupBudget();
+  const timeoutMs=budget?.remaining(5000)??5000;
+  const env=Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string,string]=>entry[1]!==undefined));
+  const proc=spawnWindowsOwned(cmd,args,{cwd:process.cwd(),env,shell:/\.(cmd|bat)$/i.test(cmd)||!/[\\/]/.test(cmd),terminateDescendantsOnRootExit:true});
+  let output="";proc.stdout.on("data",(b: Buffer)=>{if(output.length<8192) output+=b.toString("utf8").slice(0,8192-output.length);});proc.stderr.resume();
+  const result=await waitWindowsOwned(proc,{timeoutMs,signal:budget?.signal});
+  budget?.assert();
+  if(result.terminationUncertain) throw Error("Windows startup runtime probe termination uncertain");
+  return result.code===0&&!result.timedOut&&!result.cancelled?output:null;
+}
 
 function commandExists(cmd: string): boolean {
   try {
     const check = isWindows ? `where ${cmd}` : `command -v ${cmd}`;
-    execSync(check, { stdio: "pipe", windowsHide: isWindows });
+    if (isWindows) windowsWhere(cmd);
+    else execSync(check, { stdio: "pipe", timeout: 2000 });
     return true;
   } catch {
     return false;
@@ -97,7 +138,7 @@ function runnableExists(cmd: string): boolean {
   if (isWindows) {
     // Reject if every `where` hit lives under Microsoft\WindowsApps (Store stubs).
     try {
-      const out = execSync(`where ${cmd}`, { encoding: "utf-8", stdio: "pipe", windowsHide: true });
+      const out = windowsWhere(cmd);
       const hits = out.trim().split(/\r?\n/).map(p => p.trim()).filter(Boolean);
       if (hits.length === 0) return false;
       const realHits = hits.filter(p => !/\\Microsoft\\WindowsApps\\/i.test(p));
@@ -198,7 +239,7 @@ const KNOWN_GIT_BASH_PATHS = [
 function resolveWindowsBash(): string | null {
   let candidates: string[];
   try {
-    const result = execSync("where bash", { encoding: "utf-8", stdio: "pipe", windowsHide: true });
+    const result = windowsWhere("bash");
     candidates = result.trim().split(/\r?\n/).map(p => p.trim()).filter(Boolean);
   } catch {
     // bash not on PATH → genuinely unavailable. Fall through to pwsh/etc.
@@ -390,6 +431,38 @@ export function detectRuntimes(): RuntimeMap {
     elixir: commandExists("elixir") ? "elixir" : null,
     csharp: commandExists("dotnet-script") ? "dotnet-script" : null,
   };
+}
+
+/** Windows MCP startup: finite discovery, owned version probes, no cmd sync waits. */
+export async function detectStartupRuntimes(): Promise<RuntimeMap> {
+  if (!isWindows) return detectRuntimes();
+  // Embedded imports must never arm a process.exit timer in their host.
+  const budget=process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS==='1'?windowsStartupBudget():beginWindowsStartupBudget();budget?.stage('runtime discovery');
+  const bun= bunExists()?bunCommand():null;
+  const windowsBash=resolveWindowsBash();
+  const userShell=process.env.SHELL;
+  const override=userShell&&existsSync(userShell)&&isAllowlistedShell(userShell)&&!isWindowsWslBash(userShell)&&!(windowsBash&&isWindowsSystemCmd(userShell))?userShell:null;
+  let python: string|null=null;
+  for(const name of ['python3','python','py']) {
+    let hits: string[]=[];
+    try {hits=windowsWhere(name).trim().split(/\r?\n/).filter(p=>p&&!/\\Microsoft\\WindowsApps\\/i.test(p));} catch {budget?.assert();}
+    if(hits.length&&(await windowsVersion(hits[0]))!==null) {python=hits[0];break;}
+  }
+  const available=(name: string)=>commandExists(name)?name:null;
+  const runtimes: RuntimeMap={
+    javascript:resolveJavascriptRuntime(bun),typescript:bun??available('tsx')??available('ts-node'),python,
+    shell:override??resolveWindowsShell(windowsBash),ruby:available('ruby'),go:available('go'),rust:available('rustc'),php:available('php'),perl:available('perl'),
+    r:available('Rscript')??available('r'),elixir:available('elixir'),csharp:available('dotnet-script'),
+  };
+  budget?.assert();return runtimes;
+}
+export async function resolveStartupHookRuntime(): Promise<HookRuntime> {
+  if(!isWindows) return resolveHookRuntime();
+  if(_hookRuntimeCache) return _hookRuntimeCache;
+  const fallback=liveNodeRuntime();
+  if(!bunExists()) return _hookRuntimeCache=fallback;
+  const bun=bunCommand(),version=await windowsVersion(bun);
+  return _hookRuntimeCache=version!==null&&bunVersionAtLeast1(version)?{path:bun,isBun:true}:fallback;
 }
 
 export function hasBunRuntime(): boolean {

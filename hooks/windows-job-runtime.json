@@ -1,0 +1,15 @@
+{
+  "protocol": "CMJ1",
+  "sources": {
+    "windows-process-job.cs": "e9d75e94d8e875b95cdfce3596e55c031168c45e3d7e15b5124a13f43d49ec8c",
+    "windows-job-entry.cs": "0a9c0c6152160ffef5ce4432b87f8f9954b435cd22344a518e2a8fa1440655bc"
+  },
+  "sha256": "e6b8f99b64a8f5e698154ac81c296e0eeac54e37a7637dc0587d7a99ae90922f",
+  "bytes": 11264,
+  "build": {
+    "compiler": "Microsoft .NET Framework v4.0.30319 csc.exe",
+    "compilerSha256": "46809206887326d2d24db1eff1f3064de972c3451abe766b49111450a5e08e00",
+    "platform": "AnyCPU",
+    "sourceEncoding": "UTF-8 LF normalized"
+  }
+}

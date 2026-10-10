@@ -28,14 +28,16 @@ await prepare(root);
 for(const file of fs.readdirSync(native))if(file.startsWith('better_sqlite3'))fs.unlinkSync(path.join(native,file));
 const prebuild=path.join(root,'node_modules/prebuild-install');fs.mkdirSync(prebuild);fs.writeFileSync(path.join(prebuild,'package.json'),'{"name":"prebuild-install","main":"bin.js"}');
 const marker=path.join(root,'installer.json'), writes=path.join(root,'installer-writes.log');
-const writer=`const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid}));setInterval(()=>fs.appendFileSync(${JSON.stringify(writes)},'write\\n'),20)`;
+const writer=`const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid}));setInterval(()=>fs.appendFileSync(${JSON.stringify(writes)},'write\\n'),20);setTimeout(()=>process.exit(0),15000)`;
 fs.writeFileSync(path.join(prebuild,'bin.js'),`const cp=require('node:child_process');const child=cp.spawn(process.execPath,['-e',${JSON.stringify(writer)}],{windowsHide:true,detached:true,stdio:'ignore'});child.unref();setInterval(()=>{},1000);`);
 const hostCode=`import {runWindowsRepair} from ${JSON.stringify(pathToFileURL(path.join(root,'hooks/windows-repair.mjs')).href)};console.log(JSON.stringify(await runWindowsRepair(${JSON.stringify(root)})));`;
 const host=spawn(process.execPath,['--input-type=module','-e',hostCode],{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe']});const hostDone=observe(host);
 await until(()=>fs.existsSync(marker)&&fs.existsSync(writes));const installer=JSON.parse(fs.readFileSync(marker)).pid;
 const contender=await runWindowsRepair(root);
 check('installer descendant holds named ownership across repair',contender.status==='inflight'&&alive(installer),{contender,installer,alive:alive(installer)});
-const alias=path.join(base,'root-alias');fs.symlinkSync(root,alias,'junction');const aliasResult=await runWindowsRepair(alias);
+const alias=path.join(base,'root-alias');let aliasResult;
+try {fs.symlinkSync(root,alias,'junction');aliasResult=await runWindowsRepair(alias);}
+catch(error) {host.kill();await hostDone;await until(()=>!alive(installer));throw error;}
 check('canonical path aliases share repair ownership',aliasResult.status==='inflight',{aliasResult});
 const killedAt=performance.now();host.kill();await hostDone;await until(()=>!alive(installer));
 const size=fs.statSync(writes).size;await wait(150);

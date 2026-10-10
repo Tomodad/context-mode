@@ -1,5 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 export function prepareWindowsJobHelper(options?: {timeoutMs?: number; signal?: AbortSignal}): Promise<boolean>;
+export function verifiedWindowsJobHelper(hooks?: string): string;
 export function waitWindowsOwned(proc: import('node:child_process').ChildProcess, options: {
   timeoutMs: number; signal?: AbortSignal;
 }): Promise<{code: number | null; timedOut: boolean; cancelled: boolean; terminationUncertain: boolean; error?: Error}>;

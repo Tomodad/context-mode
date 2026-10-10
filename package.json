@@ -77,10 +77,12 @@
     "scripts/heal-installed-plugins.mjs",
     "scripts/plugin-cache-integrity.mjs",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts/assert-windows-job.mjs",
+    "scripts/build-windows-job.mjs"
   ],
   "scripts": {
-    "build": "tsc && node -e \"if(process.platform!=='win32'){require('fs').chmodSync('build/cli.js',0o755)}\" && npm run bundle && npm run assert-bundle && npm run assert-asymmetric-drift",
+    "build": "node scripts/assert-windows-job.mjs && tsc && node -e \"if(process.platform!=='win32'){require('fs').chmodSync('build/cli.js',0o755)}\" && npm run bundle && npm run assert-bundle && npm run assert-asymmetric-drift",
     "assert-bundle": "node scripts/assert-bundle.mjs server.bundle.mjs cli.bundle.mjs hooks/session-extract.bundle.mjs hooks/session-snapshot.bundle.mjs hooks/session-db.bundle.mjs hooks/security.bundle.mjs",
     "assert-asymmetric-drift": "node scripts/assert-asymmetric-drift.mjs",
     "bundle": "esbuild src/server.ts --bundle --platform=node --target=node18 --format=esm --outfile=server.bundle.mjs --external:better-sqlite3 --external:turndown --external:turndown-plugin-gfm --external:@mixmark-io/domino --minify && esbuild src/cli.ts --bundle --platform=node --target=node18 --format=esm --outfile=cli.bundle.mjs --external:better-sqlite3 --minify && esbuild src/session/extract.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-extract.bundle.mjs --minify && esbuild src/session/snapshot.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-snapshot.bundle.mjs --minify && esbuild src/session/db.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-db.bundle.mjs --external:better-sqlite3 --minify && esbuild src/security.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/security.bundle.mjs --minify",
@@ -99,7 +101,9 @@
     "test:compare": "npx tsx tests/context-comparison.ts",
     "test:ecosystem": "npx tsx tests/ecosystem-benchmark.ts",
     "install:openclaw": "node -e \"if(process.platform==='win32'){console.error('OpenClaw install requires bash (Git Bash or WSL)');process.exit(1)}else{require('child_process').execSync('bash scripts/install-openclaw-plugin.sh',{stdio:'inherit'})}\"",
-    "postinstall": "node scripts/postinstall.mjs"
+    "postinstall": "node scripts/postinstall.mjs",
+    "assert-windows-job": "node scripts/assert-windows-job.mjs",
+    "build:windows-job": "node scripts/build-windows-job.mjs"
   },
   "dependencies": {
     "@clack/prompts": "^1.0.1",

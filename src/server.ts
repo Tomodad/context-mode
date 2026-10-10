@@ -33,7 +33,7 @@ import {
   evaluateProjectContainment,
 } from "./security.js";
 import {
-  detectRuntimes,
+  detectStartupRuntimes,
   getRuntimeSummary,
   getAvailableLanguages,
   hasBunRuntime,
@@ -147,7 +147,9 @@ if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
   });
 }
 
-const runtimes = detectRuntimes();
+// @ts-ignore -- raw shared startup budget
+const {windowsStartupBudget}=await import('../hooks/windows-startup-budget.mjs');
+const runtimes = await detectStartupRuntimes();
 const available = getAvailableLanguages(runtimes);
 export const server = new McpServer({
   name: "context-mode",
@@ -5065,7 +5067,9 @@ async function main() {
   startLifecycleGuard({ onShutdown: () => gracefulShutdown() });
 
   const transport = new StdioServerTransport();
+  windowsStartupBudget()?.stage("MCP connection");
   await server.connect(transport);
+  windowsStartupBudget()?.complete();
 
   // #854: refresh the bridge-child idle clock on each inbound MCP message so an
   // abandoned bridge child (CONTEXT_MODE_BRIDGE_DEPTH>0) self-terminates instead

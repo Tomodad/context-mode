@@ -7,7 +7,14 @@ import { homedir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const originalCwd = process.cwd();
+const {beginWindowsStartupBudget,windowsStartupOptions}=await import('./hooks/windows-startup-budget.mjs');
+const startupBudget=beginWindowsStartupBudget();
+if(startupBudget) {
+  const {prepareWindowsJobHelper}=await import('./hooks/windows-owned-process.mjs');
+  if(!await prepareWindowsJobHelper(windowsStartupOptions())) throw Error('Windows Job release helper unavailable');
+}
 process.chdir(__dirname);
+startupBudget?.stage('configuration normalization');
 
 // Resolve the Claude Code config dir, honoring $CLAUDE_CONFIG_DIR (incl. leading ~).
 // Mirrors hooks/session-helpers.mjs::resolveConfigDir and hooks/run-hook.mjs (#453).
@@ -439,6 +446,7 @@ try{
 // and a mutated .claude-plugin/plugin.json poisons sibling tests that read
 // the file (cli.test.ts). VITEST is inherited by spawned subprocesses.
 if (!process.env.VITEST) {
+  startupBudget?.stage('hook runtime normalization');
   try {
     const { normalizeHooksOnStartup } = await import("./hooks/normalize-hooks.mjs");
     // #738: probe for Bun ≥1.0 and pass the resolved path so the static
@@ -447,8 +455,8 @@ if (!process.env.VITEST) {
     // failures (missing build, missing module) never block boot.
     let jsRuntimePath;
     try {
-      const { resolveHookRuntime } = await import("./build/runtime.js");
-      const r = resolveHookRuntime();
+      const { resolveStartupHookRuntime } = await import("./build/runtime.js");
+      const r = await resolveStartupHookRuntime();
       if (r.isBun) jsRuntimePath = r.path;
     } catch { /* best effort — fall through to nodePath default */ }
     normalizeHooksOnStartup({
@@ -462,7 +470,9 @@ if (!process.env.VITEST) {
 
 // Ensure native dependencies + ABI compatibility (shared with hooks via ensure-deps.mjs)
 // ensure-deps handles better-sqlite3 install + ABI cache/rebuild automatically (#148, #203)
-import "./hooks/ensure-deps.mjs";
+startupBudget?.stage('native dependencies');
+await import('./hooks/ensure-deps.mjs');
+startupBudget?.assert();
 // Pure-JS runtime deps used only by `ctx_fetch_and_index` (HTML → Markdown
 // pipeline runs in a sandboxed subprocess that `require.resolve()`s these at
 // call time). Plugin distributions that bypass `npm install` — most notably
@@ -487,10 +497,11 @@ import "./hooks/ensure-deps.mjs";
   const NPM_INSTALL_BG_PKGS = ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"];
   const IS_WIN32 = process.platform === "win32";
   if (IS_WIN32 && NPM_INSTALL_BG_PKGS.some(pkg => !existsSync(resolve(__dirname,'node_modules',pkg)))) {
+    startupBudget?.stage('startup JavaScript dependencies');
     // Windows installs must share native repair ownership/exclusion. Awaiting
     // cold installation costs startup time; ready installs take no helper path.
     const { runWindowsRepair } = await import('./hooks/windows-repair.mjs');
-    const result = await runWindowsRepair(__dirname, {startupDeps:true});
+    const result = await runWindowsRepair(__dirname, {startupDeps:true,...windowsStartupOptions()});
     if (!['success','inflight','backoff'].includes(result.status)) process.stderr.write(`[context-mode] startup dependency repair ${result.status}\n`);
   }
   const NPM_BIN = IS_WIN32 ? "npm.cmd" : "npm";
@@ -608,14 +619,17 @@ if (!process.env.VITEST) {
 // Bundle exists (CI-built) — start instantly
 if (process.platform === 'win32') {
   const { prepareWindowsJobHelper } = await import('./hooks/windows-owned-process.mjs');
-  // A read-only/missing framework cache keeps the original fully owned path.
-  await prepareWindowsJobHelper();
+  startupBudget?.stage('server import');
+  if(!await prepareWindowsJobHelper(windowsStartupOptions())) throw Error('Windows Job release helper unavailable');
 }
 if (existsSync(resolve(__dirname, "server.bundle.mjs"))) {
   await import("./server.bundle.mjs");
 } else {
+  if (process.platform==='win32' && !existsSync(resolve(__dirname,'build','server.js'))) {
+    throw Error('Windows server build missing; install a complete release or build explicitly before starting');
+  }
   // Dev or npm install — full build
-  if (!existsSync(resolve(__dirname, "node_modules"))) {
+  if (process.platform !== "win32" && !existsSync(resolve(__dirname, "node_modules"))) {
     try {
       execSync("npm install --silent", { cwd: __dirname, stdio: "pipe", timeout: 60000 });
     } catch { /* best effort */ }

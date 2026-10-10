@@ -329,7 +329,8 @@ const isRepairWorker = process.argv[1] && resolve(process.argv[1]) === resolve(_
 const needsWindowsRepair = typeof globalThis.Bun === 'undefined' ? !alreadyValidated : existsSync(gateBinary) && !existsSync(gateCache);
 if (!isRepairWorker && needsWindowsRepair && process.platform === 'win32') {
   const { runWindowsRepair } = await import('./windows-repair.mjs');
-  const result = await runWindowsRepair(root);
+  const {windowsStartupOptions}=await import('./windows-startup-budget.mjs');
+  const result = await runWindowsRepair(root,windowsStartupOptions());
   if (!['success', 'inflight', 'backoff'].includes(result.status)) {
     process.stderr.write(`[context-mode] owned repair ${result.status}\n`);
   }

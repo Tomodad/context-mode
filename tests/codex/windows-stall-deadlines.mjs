@@ -42,45 +42,38 @@ if(rust){
   const ms=performance.now()-started;
   check('Rust compile plus run shares caller timeout',result.timedOut===true&&ms<2300,{result,ms,budgetMs:1600});
 }
-const files=['windows-owned-process.mjs','windows-process-job.ps1','windows-process-job.cs','windows-job-entry.cs','windows-job-cache-worker.mjs','windows-repair.mjs','repair-gate.mjs'];
+const files=['windows-owned-process.mjs','windows-process-job.ps1','windows-process-job.cs','windows-job-entry.cs','windows-job-runtime.exe','windows-job-runtime.json','windows-startup-budget.mjs','windows-repair.mjs','repair-gate.mjs'];
 function fixture(name){const dir=path.join(root,name),hooks=path.join(dir,'hooks');fs.mkdirSync(hooks,{recursive:true});for(const f of files)fs.copyFileSync(path.join(repo,'hooks',f),path.join(hooks,f));return {dir,hooks}}
-for(const kind of ['prepare','repair']) for(const mode of ['timeout','cancel']){
+for(const kind of ['repair']) for(const mode of ['timeout','cancel']){
   const f=fixture(kind+'-'+mode),marker=path.join(f.dir,'pids.json');
   const child=`require('node:fs').writeFileSync(${JSON.stringify(marker)},JSON.stringify({worker:process.ppid,child:process.pid}));setInterval(()=>{},1000)`;
   const hang=`import {spawn} from 'node:child_process';if(process.argv.includes('--record-timeout')){console.log(JSON.stringify({status:'failure'}));process.exit(1);}spawn(process.execPath,['-e',${JSON.stringify(child)}],{detached:true,windowsHide:true,stdio:'ignore'}).unref();setInterval(()=>{},1000);`;
-  const worker=path.join(f.hooks,kind==='prepare'?'windows-job-cache-worker.mjs':'repair-worker.mjs');fs.writeFileSync(worker,hang);
+  const worker=path.join(f.hooks,'repair-worker.mjs');fs.writeFileSync(worker,hang);
   const owned=await import(pathToFileURL(path.join(f.hooks,'windows-owned-process.mjs')).href);
   const repair=kind==='repair'?await import(pathToFileURL(path.join(f.hooks,'windows-repair.mjs')).href):null;
   const controller=new AbortController(),started=performance.now();
-  const call=kind==='prepare'?owned.prepareWindowsJobHelper({timeoutMs:mode==='timeout'?3000:10000,signal:controller.signal}):repair.runWindowsRepair(f.dir,{timeoutMs:mode==='timeout'?3000:10000,signal:controller.signal});
+  const call=repair.runWindowsRepair(f.dir,{timeoutMs:mode==='timeout'?3000:10000,signal:controller.signal});
   await until(()=>fs.existsSync(marker));const pids=JSON.parse(fs.readFileSync(marker));if(mode==='cancel')controller.abort();
   const result=await call;const workerAliveAtReturn=alive(pids.worker),childAliveAtReturn=alive(pids.child);await until(()=>!alive(pids.worker)&&!alive(pids.child));const ms=performance.now()-started;
-  const expected=kind==='prepare'?result===false:result.status===(mode==='timeout'?'timed-out':'cancelled');
+  const expected=result.status===(mode==='timeout'?'timed-out':'cancelled');
   check(kind+' '+mode+' closes Job before return',expected&&!workerAliveAtReturn&&!childAliveAtReturn&&ms<6000,{result,ms,pids,workerAliveAtReturn,childAliveAtReturn});
-  if(kind==='prepare'){
-    fs.copyFileSync(path.join(repo,'hooks/windows-job-cache-worker.mjs'),worker);
-    const next=await owned.prepareWindowsJobHelper({timeoutMs:30000});check(kind+' recovers after '+mode,next,{ready:next});
-  }else{
-    fs.writeFileSync(worker,'console.log(JSON.stringify({status:"success"}));');
-    const next=await repair.runWindowsRepair(f.dir,{timeoutMs:10000});check(kind+' recovers after '+mode,next.status==='success',next);
-  }
+
 }
 // Pre-Job startup stall: stop the exact PowerShell helper, run no worker.
-const early=fixture('pre-job-startup-stall'), marker=path.join(early.dir,'must-not-run');
-fs.writeFileSync(path.join(early.hooks,'windows-process-job.ps1'),'Start-Sleep -Seconds 30\n'+fs.readFileSync(path.join(early.hooks,'windows-process-job.ps1'),'utf8'));
-fs.writeFileSync(path.join(early.hooks,'windows-job-cache-worker.mjs'),`import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},'ran');`);
+const early=fixture('no-compiler-fallback'),marker=path.join(early.dir,'must-not-run');
+fs.writeFileSync(path.join(early.hooks,'windows-process-job.ps1'),`Start-Sleep -Seconds 10\n[IO.File]::WriteAllText('${marker.replaceAll("'","''")}', 'ran')\n`);
 const earlyOwned=await import(pathToFileURL(path.join(early.hooks,'windows-owned-process.mjs')).href);
-const at=performance.now(), earlyResult=await earlyOwned.prepareWindowsJobHelper({timeoutMs:200}),earlyMs=performance.now()-at;
-check('pre-Job PowerShell startup stall is bounded and no worker runs',earlyResult===false&&earlyMs<4000&&!fs.existsSync(marker),{result:earlyResult,ms:earlyMs,targetRan:fs.existsSync(marker),scope:'No claim about pre-Job Add-Type compiler descendants'});
+const at=performance.now(),earlyResult=await earlyOwned.prepareWindowsJobHelper({timeoutMs:2000}),earlyMs=performance.now()-at;
+check('cold prepare never invokes legacy PowerShell fallback',earlyResult===true&&earlyMs<2500&&!fs.existsSync(marker),{result:earlyResult,ms:earlyMs,targetRan:fs.existsSync(marker)});
 // OS kill failure / no close is a fault on our exact fixture ChildProcess.
 const uncertain=fixture('no-close'), uncertainOwned=await import(pathToFileURL(path.join(uncertain.hooks,'windows-owned-process.mjs')).href);
 fs.writeFileSync(path.join(uncertain.hooks,'windows-process-job.ps1'),'Start-Sleep -Seconds 10\n');
-const proc=uncertainOwned.spawnWindowsOwned(process.execPath,['-e','process.exit(0)'],{cwd:uncertain.dir,env:process.env});proc.stdout.resume();proc.stderr.resume();
-const realKill=proc.kill.bind(proc);proc.kill=()=>false;
+const proc=uncertainOwned.spawnWindowsOwned(process.execPath,['-e','setInterval(()=>{},1000)'],{cwd:uncertain.dir,env:process.env});proc.stdout.resume();proc.stderr.resume();
+const realKill=proc.kill.bind(proc),realEnd=proc.stdin.end.bind(proc.stdin);proc.kill=()=>false;proc.stdin.end=()=>proc.stdin;
 const before=performance.now(),noClose=await uncertainOwned.waitWindowsOwned(proc,{timeoutMs:200});
 const stillAlive=alive(proc.pid),noCloseMs=performance.now()-before;
 check('failed OS termination returns bounded uncertain state',noClose.terminationUncertain&&noClose.timedOut&&stillAlive&&noCloseMs<2500,{result:noClose,ms:noCloseMs,helperAliveAtReturn:stillAlive});
-const ended=new Promise(r=>proc.once('close',r));proc.ref();realKill();await ended;
+const ended=new Promise(r=>proc.once('close',r));proc.ref();proc.stdin.end=realEnd;realKill();await ended;
 // Cancellation also reaches the bounded timeout-status worker, not just the
 // original repair. Both synthetic workers use the production owned Job path.
 const phase=fixture('cancel-timeout-record'), phaseMarker=path.join(phase.dir,'record-child.pid');

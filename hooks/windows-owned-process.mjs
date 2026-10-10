@@ -6,65 +6,44 @@ import { createHash } from 'node:crypto';
 
 const owned = new WeakSet();
 const stopping = new WeakMap();
-const identities = new Map();
-const unavailable = new Set();
+const SOURCE_FILES = ['windows-process-job.cs', 'windows-job-entry.cs'];
 function helperPath() {
   const here = dirname(fileURLToPath(import.meta.url));
   for (const parent of [here, resolve(here, '..'), resolve(here, '../..')]) {
-    const file = join(parent, 'hooks', 'windows-process-job.ps1');
+    const file = join(parent, 'hooks', 'windows-job-runtime.json');
     if (existsSync(file)) return file;
   }
-  throw new Error('Windows process Job helper missing');
+  throw new Error('Windows process Job release asset missing; reinstall a complete release');
 }
-function cacheIdentity(hooks) {
-  const framework=join(process.env.SystemRoot??'C:\\Windows','Microsoft.NET',process.arch==='x64'?'Framework64':'Framework','v4.0.30319');
+export function verifiedWindowsJobHelper(hooks = dirname(helperPath())) {
   try {
-    const sources=['windows-process-job.cs','windows-job-entry.cs','windows-job-cache-worker.mjs','windows-owned-process.mjs'].map(file=>join(hooks,file));
-    const systemFiles=['csc.exe','mscorlib.dll','System.dll','clr.dll'].map(file=>join(framework,file));
-    const sourceDigest=createHash('sha256');for(const file of sources) sourceDigest.update(file+'\0').update(readFileSync(file));
-    const sourceKey=sourceDigest.digest('hex');
-    const systemStamp=systemFiles.map(file=>{const s=statSync(file);return file+':'+s.size+':'+s.mtimeMs+':'+s.ctimeMs}).join('\0');
-    const previous=identities.get(hooks);
-    if(previous?.sourceKey===sourceKey && previous.systemStamp===systemStamp) return previous;
-    const digest=createHash('sha256').update('CMJ1\0'+process.arch+'\0'+framework+'\0'+sourceKey+'\0');
-    // Fixed, bounded framework/source paths; no ambient compiler discovery.
-    for(const file of systemFiles) {
-      digest.update(file+'\0').update(readFileSync(file));
+    const manifest = join(hooks, 'windows-job-runtime.json');
+    if (statSync(manifest).size > 4096) throw Error('manifest size');
+    const metadata = JSON.parse(readFileSync(manifest, 'utf8'));
+    const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+    if (metadata.protocol !== 'CMJ1') throw Error('protocol');
+    for (const name of SOURCE_FILES) {
+      if(statSync(join(hooks,name)).size>1048576) throw Error('source size');
+      const text = readFileSync(join(hooks,name), 'utf8').replaceAll('\r\n','\n');
+      if (digest(Buffer.from(text)) !== metadata.sources?.[name]) throw Error('source mismatch');
     }
-    const identity={key:digest.digest('hex'),framework,sourceKey,systemStamp};identities.set(hooks,identity);return identity;
-  } catch { return null; }
-}
-function cachedHelper(hooks,identity=cacheIdentity(hooks)) {
-  if(!identity) return null;
-  if(unavailable.has(identity.key)) return null;
-  try {
-    const cache=join(hooks,'.windows-job-cache'),marker=join(cache,identity.key+'.json');
-    if(statSync(marker).size>4096) return null;
-    const metadata=JSON.parse(readFileSync(marker,'utf8'));
-    if(metadata.key!==identity.key || !new RegExp('^'+identity.key+'-[0-9a-f-]{36}/job\\.exe$').test(metadata.relative) || !/^[0-9a-f]{64}$/.test(metadata.sha256)) return null;
-    const exe=join(cache,metadata.relative),size=statSync(exe).size;
-    if(size!==metadata.bytes || size>10485760) return null;
-    if(createHash('sha256').update(readFileSync(exe)).digest('hex')!==metadata.sha256) return null;
+    const exe = join(hooks, 'windows-job-runtime.exe');
+    const size = statSync(exe).size;
+    if (size !== metadata.bytes || size < 1 || size > 10485760 || digest(readFileSync(exe)) !== metadata.sha256) throw Error('asset mismatch');
     return exe;
-  } catch { return null; }
+  } catch {
+    throw new Error('Windows process Job release asset invalid; reinstall a complete release');
+  }
 }
 export async function prepareWindowsJobHelper({timeoutMs = 30_000, signal} = {}) {
   validateDeadline(timeoutMs);
-  if(signal?.aborted) return false;
-  if(process.platform!=='win32') return false;
-  const hooks=dirname(helperPath()),identity=cacheIdentity(hooks);
-  if(!identity) return false;
-  if(unavailable.has(identity.key)) return false;
-  if(cachedHelper(hooks,identity)) return true;
-  // First build uses the PowerShell path. The cache worker and its compiler
-  // run in the named Job once PowerShell has loaded the Job implementation.
-  // Initial Add-Type compilation happens before that Job exists.
-  const proc=spawnWindowsOwned(process.execPath,[join(hooks,'windows-job-cache-worker.mjs'),hooks,identity.key,identity.framework],{
-    cwd:hooks,env:process.env,jobName:'Local\\ContextModeHelperBuild-'+identity.key,terminateDescendantsOnRootExit:true,
-  });
-  proc.stdout.resume();proc.stderr.resume();
+  if (signal?.aborted || timeoutMs === 0 || process.platform !== 'win32') return false;
+  // No runtime compiler, cache write, PowerShell or unowned fallback.
+  const proc=spawn(verifiedWindowsJobHelper(),['--check'],{windowsHide:true,stdio:['pipe','pipe','pipe']});
+  owned.add(proc);proc.stdin.on('error',()=>{});
+  let output='';proc.stdout.on('data',b=>{if(output.length<32) output+=b.toString('utf8').slice(0,32-output.length);});proc.stderr.resume();
   const result=await waitWindowsOwned(proc,{timeoutMs,signal});
-  return !result.terminationUncertain && !result.timedOut && !result.cancelled && result.code===0 && cachedHelper(hooks,identity)!==null;
+  return result.code===0&&!result.cancelled&&!result.timedOut&&!result.terminationUncertain&&output.trim()==='CMJ1';
 }
 function validateDeadline(timeoutMs) {
   if(!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647) throw new RangeError('Windows owned process deadline must be finite and non-negative');
@@ -149,19 +128,11 @@ export function spawnWindowsOwned(command, args, options) {
   }
   if (pathEntry) entries.set('path',['PATH',String(pathEntry[1])]);
   const environmentBlock = [...entries.values()].sort(([a],[b]) => a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0).map(([key,value]) => key + '=' + value).join('\0') + '\0\0';
-  const script=helperPath(),cached=cachedHelper(dirname(script));
-  const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const helper = verifiedWindowsJobHelper();
   const request={exe,commandLine,cwd,environmentBlock,jobName,terminateDescendantsOnRootExit};
-  const input=cached?binaryRequest(request):JSON.stringify(request)+'\n';
-  const proc = spawn(cached??powershell, cached?[]:['-NoProfile','-NonInteractive','-File',script], {
-    cwd, windowsHide:true, stdio:['pipe','pipe','pipe'],
-  });
+  const input=binaryRequest(request);
+  const proc = spawn(helper, [], {cwd, windowsHide:true, stdio:['pipe','pipe','pipe']});
   owned.add(proc);
-  if(cached) proc.once('error', () => {
-    // A creation error means no helper/target started. Disable this cache for
-    // subsequent calls. Never replay an already-started user command.
-    const identity=cacheIdentity(dirname(script));if(identity) unavailable.add(identity.key);
-  });
   proc.stdin.on('error', () => {}); // helper policy/creation failure may close input
   proc.stdin.write(input);
   return proc;
