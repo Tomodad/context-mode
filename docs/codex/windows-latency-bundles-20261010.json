@@ -1,15 +1,25 @@
 {
-  "source_commit": "1ccb945c9e2207cb2c4d785d6669c53d32d68cc1",
-  "prior_candidate": "5aced8f578e7a507efa87cc991346e6156e0ddc9",
+  "source_commit": "5c995a2ad6c4fba9a86aef5fbc1bb146c01e633a",
+  "prior_candidate": "8ba105156c92c2f40fdb58a61b14b93b5937b849",
+  "original_windows_candidate": "5aced8f578e7a507efa87cc991346e6156e0ddc9",
   "toolchain": {
-    "node": "24.13.0",
+    "node": "v24.13.0",
+    "node_abi": "137",
     "typescript": "5.9.3",
     "esbuild": "0.27.7",
+    "better-sqlite3": "12.9.0",
+    "vitest": "4.1.5",
+    "turndown": "7.2.4",
+    "turndown-plugin-gfm": "1.0.2",
+    "@mixmark-io/domino": "2.2.0",
+    "@modelcontextprotocol/sdk": "1.26.0",
+    "npm_direct_cli": "11.6.2",
+    "npm_shim": "11.8.0",
     "lock": "unchanged bun.lock"
   },
   "bundles": {
-    "server.bundle.mjs": "17dc3c284f6e6ae21a5757342e931d60777857d9c835ad531fc952d238a25a46",
-    "cli.bundle.mjs": "a95b12a27a736fc03d7d2d941b7d9bbc14e0a963e9e7502433c9f7c4e9aa1802",
+    "server.bundle.mjs": "0b472f0d23e2c129467360253b73d59e7ad84ebc9236c2c29afc16f8cf01092d",
+    "cli.bundle.mjs": "51a5c3d90e3b37b1083df6f6d2b5d0186c8624d65345b3cfc7a85f8778792beb",
     "hooks/session-extract.bundle.mjs": "ef5513aac4c53d321b2f676da211e67302d16fc310330239f2956d47799caa5f",
     "hooks/session-snapshot.bundle.mjs": "19f5d48a85fc85754ec1a309963c7e118713be071c2180193725016f78a23411",
     "hooks/session-db.bundle.mjs": "3c6d6bd84ccc4be95898010cd939462be7390b31f1cd959aa9bf750361ea4e4c",
@@ -21,8 +31,40 @@
     "manifest_assertion": true,
     "independent_rebuild_hashes_equal": true,
     "pack_dry_run_required_paths_present": true,
-    "release_bundle_isolated_mcp_cancel_smoke": true
+    "native_12_9_0_p2_regressions": true,
+    "p2_regression_count": 19,
+    "affected_existing_tests": {
+      "files": 2,
+      "tests": 8,
+      "passed": true
+    },
+    "full_isolated_start_phases": [
+      {
+        "phase": "cold",
+        "passed": true,
+        "nativeChanged": true,
+        "initializeMs": 2648.7557
+      },
+      {
+        "phase": "first-warm",
+        "passed": true,
+        "nativeChanged": true,
+        "initializeMs": 2793.8318000000004
+      },
+      {
+        "phase": "steady-warm",
+        "passed": true,
+        "nativeChanged": false,
+        "initializeMs": 2513.8068999999987
+      }
+    ],
+    "release_mcp_batch_cancel": true,
+    "actual_inherited_stdio_orphan": false,
+    "actual_desktop_loader": null,
+    "visible_windowsHide": null,
+    "restart_resume": null
   },
   "limitations_document": "docs/codex/windows-latency-candidate-20261010.md",
-  "deployment_recommended": false
+  "deployment_recommended": false,
+  "installation_switched": false
 }
