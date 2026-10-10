@@ -19,7 +19,7 @@
  * @see https://github.com/mksglu/context-mode/issues/203
  */
 
-import { existsSync, copyFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, copyFileSync, renameSync, unlinkSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
 import { delimiter, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -150,7 +150,24 @@ function probeNativeInProcess(pluginRoot) {
   }
 }
 
+function nativeSwapStamp(abiCachePath, binaryPath) {
+  try {
+    const c = statSync(abiCachePath);
+    const b = statSync(binaryPath);
+    return `${abiCachePath}:${c.size}:${c.mtimeMs}|${b.size}:${b.mtimeMs}:${b.ino}`;
+  } catch {
+    return null;
+  }
+}
+
 function replaceActiveNativeBinaryFromCache(abiCachePath, binaryPath) {
+  const stampPath = `${binaryPath}.swap-stamp`;
+  const current = nativeSwapStamp(abiCachePath, binaryPath);
+  if (current !== null) {
+    try {
+      if (readFileSync(stampPath, "utf8") === current) return;
+    } catch { /* no stamp yet — swap below */ }
+  }
   const tmpPath = `${binaryPath}.staging-${process.pid}-${Date.now()}`;
   try {
     copyFileSync(abiCachePath, tmpPath);
@@ -159,6 +176,16 @@ function replaceActiveNativeBinaryFromCache(abiCachePath, binaryPath) {
   } catch (err) {
     try { unlinkSync(tmpPath); } catch { /* best effort cleanup */ }
     throw err;
+  }
+  // A missing or unwritable stamp only means the next call swaps again.
+  const installed = nativeSwapStamp(abiCachePath, binaryPath);
+  if (installed === null) return;
+  const stampTmp = `${stampPath}.${process.pid}-${Date.now()}`;
+  try {
+    writeFileSync(stampTmp, installed);
+    renameSync(stampTmp, stampPath);
+  } catch {
+    try { unlinkSync(stampTmp); } catch { /* best effort cleanup */ }
   }
 }
 
@@ -290,5 +317,18 @@ export function codesignBinary(binaryPath) {
 // Auto-run on import (like suppress-stderr.mjs).
 // Top-level await ensures the heal completes before the importer's next
 // statement runs (which is typically `new Database(...)`).
-await ensureDeps();
-ensureNativeCompat(root);
+// Experimental gate covers missing package, missing binding and ABI repair together.
+const { withRepairGate } = await import("./repair-gate.mjs");
+const gateBinary = resolve(root, "node_modules", "better-sqlite3", "build", "Release", "better_sqlite3.node");
+const gateCache = resolve(dirname(gateBinary), `better_sqlite3.abi${process.versions.modules}.node`);
+let alreadyValidated = false;
+try { alreadyValidated = readFileSync(`${gateBinary}.swap-stamp`, "utf8") === nativeSwapStamp(gateCache, gateBinary); } catch {}
+if (alreadyValidated) {
+  ensureNativeCompat(root);
+} else {
+  await withRepairGate(root, async () => {
+    await ensureDeps();
+    ensureNativeCompat(root);
+    return probeNativeInChildProcess(root);
+  });
+}
