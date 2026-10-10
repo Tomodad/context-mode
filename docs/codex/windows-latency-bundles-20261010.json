@@ -1,70 +1,88 @@
 {
-  "source_commit": "5c995a2ad6c4fba9a86aef5fbc1bb146c01e633a",
-  "prior_candidate": "8ba105156c92c2f40fdb58a61b14b93b5937b849",
-  "original_windows_candidate": "5aced8f578e7a507efa87cc991346e6156e0ddc9",
-  "toolchain": {
+  "source_commit": "2860a372eb59a9cee829e32903eaa5573a944e8b",
+  "previous_candidate": "b518ad98d3e857aa97b85abc2937dc83438cccd1",
+  "built_utc": "2026-10-10T12:16:46.992659+00:00",
+  "runtime": {
     "node": "v24.13.0",
-    "node_abi": "137",
+    "abi": "137",
+    "npm_direct_cli": "11.6.2",
+    "npm_path_shim": "11.8.0"
+  },
+  "toolchain": {
     "typescript": "5.9.3",
     "esbuild": "0.27.7",
     "better-sqlite3": "12.9.0",
     "vitest": "4.1.5",
+    "@modelcontextprotocol/sdk": "1.26.0",
     "turndown": "7.2.4",
     "turndown-plugin-gfm": "1.0.2",
-    "@mixmark-io/domino": "2.2.0",
-    "@modelcontextprotocol/sdk": "1.26.0",
-    "npm_direct_cli": "11.6.2",
-    "npm_shim": "11.8.0",
-    "lock": "unchanged bun.lock"
+    "@mixmark-io/domino": "2.2.0"
   },
-  "bundles": {
-    "server.bundle.mjs": "0b472f0d23e2c129467360253b73d59e7ad84ebc9236c2c29afc16f8cf01092d",
-    "cli.bundle.mjs": "51a5c3d90e3b37b1083df6f6d2b5d0186c8624d65345b3cfc7a85f8778792beb",
-    "hooks/session-extract.bundle.mjs": "ef5513aac4c53d321b2f676da211e67302d16fc310330239f2956d47799caa5f",
-    "hooks/session-snapshot.bundle.mjs": "19f5d48a85fc85754ec1a309963c7e118713be071c2180193725016f78a23411",
-    "hooks/session-db.bundle.mjs": "3c6d6bd84ccc4be95898010cd939462be7390b31f1cd959aa9bf750361ea4e4c",
-    "hooks/security.bundle.mjs": "8d9231182dee7dd4e159101450695b9b5efc14e7812c710a8f4ebfbf4b482c06"
-  },
-  "verification": {
-    "tsc": true,
-    "bundle_assertions": true,
-    "manifest_assertion": true,
-    "independent_rebuild_hashes_equal": true,
-    "pack_dry_run_required_paths_present": true,
-    "native_12_9_0_p2_regressions": true,
-    "p2_regression_count": 19,
-    "affected_existing_tests": {
-      "files": 2,
-      "tests": 8,
-      "passed": true
+  "hashes": [
+    {
+      "file": "server.bundle.mjs",
+      "sha256": "f3d85fc85465d5c36d21192b0f42d9212e81d15914315cdd6d14b47225c3553e",
+      "independent": "f3d85fc85465d5c36d21192b0f42d9212e81d15914315cdd6d14b47225c3553e",
+      "identical": true
     },
-    "full_isolated_start_phases": [
-      {
-        "phase": "cold",
-        "passed": true,
-        "nativeChanged": true,
-        "initializeMs": 2648.7557
-      },
-      {
-        "phase": "first-warm",
-        "passed": true,
-        "nativeChanged": true,
-        "initializeMs": 2793.8318000000004
-      },
-      {
-        "phase": "steady-warm",
-        "passed": true,
-        "nativeChanged": false,
-        "initializeMs": 2513.8068999999987
-      }
-    ],
-    "release_mcp_batch_cancel": true,
-    "actual_inherited_stdio_orphan": false,
-    "actual_desktop_loader": null,
-    "visible_windowsHide": null,
-    "restart_resume": null
+    {
+      "file": "cli.bundle.mjs",
+      "sha256": "5abe1300bf593e3c8ba39358f71e21a85576312c672ae408cd4983329dfb84cc",
+      "independent": "5abe1300bf593e3c8ba39358f71e21a85576312c672ae408cd4983329dfb84cc",
+      "identical": true
+    },
+    {
+      "file": "hooks/session-extract.bundle.mjs",
+      "sha256": "ef5513aac4c53d321b2f676da211e67302d16fc310330239f2956d47799caa5f",
+      "independent": "ef5513aac4c53d321b2f676da211e67302d16fc310330239f2956d47799caa5f",
+      "identical": true
+    },
+    {
+      "file": "hooks/session-snapshot.bundle.mjs",
+      "sha256": "19f5d48a85fc85754ec1a309963c7e118713be071c2180193725016f78a23411",
+      "independent": "19f5d48a85fc85754ec1a309963c7e118713be071c2180193725016f78a23411",
+      "identical": true
+    },
+    {
+      "file": "hooks/session-db.bundle.mjs",
+      "sha256": "3c6d6bd84ccc4be95898010cd939462be7390b31f1cd959aa9bf750361ea4e4c",
+      "independent": "3c6d6bd84ccc4be95898010cd939462be7390b31f1cd959aa9bf750361ea4e4c",
+      "identical": true
+    },
+    {
+      "file": "hooks/security.bundle.mjs",
+      "sha256": "8d9231182dee7dd4e159101450695b9b5efc14e7812c710a8f4ebfbf4b482c06",
+      "independent": "8d9231182dee7dd4e159101450695b9b5efc14e7812c710a8f4ebfbf4b482c06",
+      "identical": true
+    }
+  ],
+  "windows_process_cases": 25,
+  "repair_lifecycle_cases": 7,
+  "windows_shell_cases": 9,
+  "full_start_phases": 3,
+  "affected_tests": 4,
+  "raw_hook_cases": 4,
+  "pack": {
+    "file_count": 376,
+    "required_paths": {
+      "start.mjs": true,
+      "hooks/repair-gate.mjs": true,
+      "hooks/ensure-deps.mjs": true,
+      "hooks/repair-worker.mjs": true,
+      "hooks/windows-repair.mjs": true,
+      "hooks/windows-owned-process.mjs": true,
+      "hooks/windows-owned-process.d.mts": true,
+      "hooks/windows-process-job.ps1": true,
+      "hooks/windows-process-job.cs": true,
+      ".codex-plugin/mcp.json": true,
+      "server.bundle.mjs": true,
+      "cli.bundle.mjs": true,
+      "hooks/session-extract.bundle.mjs": true,
+      "hooks/session-snapshot.bundle.mjs": true,
+      "hooks/session-db.bundle.mjs": true,
+      "hooks/security.bundle.mjs": true
+    },
+    "passed": true
   },
-  "limitations_document": "docs/codex/windows-latency-candidate-20261010.md",
-  "deployment_recommended": false,
-  "installation_switched": false
+  "deployed": false
 }
