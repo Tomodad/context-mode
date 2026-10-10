@@ -49,7 +49,8 @@ global configuration, permission change or paid model experiment was added.
 | Full isolated start | 3/3; initialize 5.095/2.799/2.421s, tools/index/search, full last line and exact Unicode write, exit37 and EOF0 |
 | Real bundled MCP batch | Child dead, two queued jobs never started, no cancelled output indexed, follow-up search responded, EOF0; deliberate 2300ms wait / observed 2329ms is not cancellation latency |
 
-Fixed direct npm11.6.2 dry-run pack contains378 files, includes the raw helpers
+Fixed direct npm11.6.2 dry-run pack contains380 files after adding the two
+acceptance documents (the earlier pre-documentation check contained378), includes the raw helpers
 and excludes mutable `.windows-job-cache`. No dependencies were installed.
 
 TypeScript and six independent bundle rebuilds/assertions pass. Unchanged cloud
