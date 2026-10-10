@@ -28,7 +28,7 @@ Package/manifest label is still 1.0.169; it does not identify the commit. Local 
 | Existing affected tests | 4/4, correct candidate root, serial, own ASCII temp (8.3/long-path assertion ambiguity excluded) |
 | Raw Codex hooks | 4/4 pass/deny/unsupported-ask/ondemand SessionStart; raw invocation is not host-hook-loader proof |
 | Existing live ctx_execute bridge | Candidate helper returns Chinese output and exit37; existing plugin remains installed |
-| Real bundled MCP batch cancellation | Child dead, two queued jobs never started, no results indexed; 2.351s observed cancellation-to-response, EOF0 |
+| Real bundled MCP batch cancellation | Child dead, two queued jobs never started, no results indexed; observed after a deliberate 2.3s wait (2.351s including search), EOF0; not a cancellation latency measurement |
 | Release | TypeScript plus six existing bundle commands/assertions, independent identical rebuild and required package paths pass |
 
 The original 19-case SQLite gate/statistics correctness baseline remains unchanged and was not retested merely for statistics optimization. No filesystem statistics memo was reintroduced. Fixture mistakes (early .done omission, missing SystemRoot in a minimal PATH fixture, task-root Vitest selecting sibling copies) are excluded from candidate outcomes; final narrow fixtures resolve them. Fault injection tests copies of the helper, not production environment bypasses.
