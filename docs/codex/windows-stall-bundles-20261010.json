@@ -1,0 +1,52 @@
+{
+  "node": "v24.13.0",
+  "abi": "137",
+  "toolchain": {
+    "typescript": "5.9.3",
+    "esbuild": "0.27.7",
+    "better-sqlite3": "12.9.0",
+    "vitest": "4.1.5",
+    "@modelcontextprotocol/sdk": "1.26.0",
+    "turndown": "7.2.4",
+    "turndown-plugin-gfm": "1.0.2",
+    "@mixmark-io/domino": "2.2.0"
+  },
+  "hashes": [
+    {
+      "file": "server.bundle.mjs",
+      "sha256": "1e6ca2462834c83efb0d4bf35d11bf7e3e5546193fab35259320d7dfae815565",
+      "independent": "1e6ca2462834c83efb0d4bf35d11bf7e3e5546193fab35259320d7dfae815565",
+      "identical": true
+    },
+    {
+      "file": "cli.bundle.mjs",
+      "sha256": "f3f2f1ef6e9a5524f824f4ea81c01b27cbdc839dc15b3b331e930b682aa258e6",
+      "independent": "f3f2f1ef6e9a5524f824f4ea81c01b27cbdc839dc15b3b331e930b682aa258e6",
+      "identical": true
+    },
+    {
+      "file": "hooks/session-extract.bundle.mjs",
+      "sha256": "ef5513aac4c53d321b2f676da211e67302d16fc310330239f2956d47799caa5f",
+      "independent": "ef5513aac4c53d321b2f676da211e67302d16fc310330239f2956d47799caa5f",
+      "identical": true
+    },
+    {
+      "file": "hooks/session-snapshot.bundle.mjs",
+      "sha256": "19f5d48a85fc85754ec1a309963c7e118713be071c2180193725016f78a23411",
+      "independent": "19f5d48a85fc85754ec1a309963c7e118713be071c2180193725016f78a23411",
+      "identical": true
+    },
+    {
+      "file": "hooks/session-db.bundle.mjs",
+      "sha256": "3c6d6bd84ccc4be95898010cd939462be7390b31f1cd959aa9bf750361ea4e4c",
+      "independent": "3c6d6bd84ccc4be95898010cd939462be7390b31f1cd959aa9bf750361ea4e4c",
+      "identical": true
+    },
+    {
+      "file": "hooks/security.bundle.mjs",
+      "sha256": "8d9231182dee7dd4e159101450695b9b5efc14e7812c710a8f4ebfbf4b482c06",
+      "independent": "8d9231182dee7dd4e159101450695b9b5efc14e7812c710a8f4ebfbf4b482c06",
+      "identical": true
+    }
+  ]
+}

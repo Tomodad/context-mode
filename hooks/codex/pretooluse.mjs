@@ -4,11 +4,11 @@ import "../suppress-stderr.mjs";
 /**
  * Codex CLI preToolUse hook for context-mode.
  *
- * Codex PreToolUse honors `permissionDecision:"deny"` on all builds, and
- * `permissionDecision:"allow" + updatedInput` / `additionalContext` on
- * codex-cli >= 0.141.0 (#845). Capability is detected at runtime by
- * codex-caps.mjs; older builds fail closed (redirect → deny). `ask` is still
- * unsupported. Source: codex-rs/hooks/src/engine/output_parser.rs
+ * Command rewrites require evidence about the actual running host, rather than
+ * an independently installed PATH CLI. codex-caps.mjs currently reports this
+ * contract as unverified, so command redirects returned by routing emit deny
+ * plus guidance. Existing RTK-owned Shell passthrough is unchanged. No ordinary
+ * input/configuration flag enables allow+updatedInput. `ask` remains unsupported.
  */
 
 import { dirname, resolve } from "node:path";
@@ -28,8 +28,8 @@ const toolInput = input.tool_input ?? {};
 const projectDir = getInputProjectDir(input, CODEX_OPTS);
 
 const decision = routePreToolUse(tool, toolInput, projectDir, "codex", getSessionId(input, CODEX_OPTS));
-// #845: only modify/context depend on Codex's rewrite capability. Detection is
-// cached, but skip the probe entirely for deny / ask / passthrough decisions.
+// Only modify/context need the host-contract guard. The guard does not spawn a
+// CLI or read a shared cache; deny / ask / passthrough keep their existing shape.
 const needsCaps = decision && (decision.action === "modify" || decision.action === "context");
 const response = formatDecision(
   "codex",

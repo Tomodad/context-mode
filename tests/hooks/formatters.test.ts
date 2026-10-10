@@ -1,7 +1,4 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 // Dynamic import for .mjs modules
 let claudeCodeFormat: (decision: unknown) => unknown;
@@ -14,7 +11,8 @@ let kimiFormat: (decision: unknown) => unknown;
 // agy has no standalone formatter either — same central-registry convention.
 let agyFormat: (decision: unknown) => unknown;
 // codex has no standalone formatter — central registry only. It takes an
-// optional capability hint ({ codexSupportsRewrite }) threaded by the hook (#845).
+// optional capability hint ({ codexSupportsRewrite }) simulated in format-only
+// tests. The production hook currently has no verified running-host source.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose test seams over .mjs
 let codexFormat: (decision: unknown, opts?: any) => unknown;
 // codex capability detection helpers (#845, hooks/core/codex-caps.mjs).
@@ -390,7 +388,7 @@ describe("formatDecision", () => {
 // the same #845 feature, so its unit tests live here too rather than a new file.
 describe("codex formatter (#845)", () => {
   describe("modify", () => {
-    it("capable Codex: emits permissionDecision:allow + updatedInput (command rewrite)", () => {
+    it("simulated verified host: emits permissionDecision:allow + updatedInput", () => {
       const out = codexFormat(modifyDecision, { codexSupportsRewrite: true }) as {
         hookSpecificOutput: Record<string, unknown>;
       };
@@ -426,7 +424,7 @@ describe("codex formatter (#845)", () => {
   });
 
   describe("context", () => {
-    it("capable Codex: surfaces additionalContext", () => {
+    it("simulated verified host: surfaces additionalContext", () => {
       const out = codexFormat(contextDecision, { codexSupportsRewrite: true });
       expect(out).toEqual({
         hookSpecificOutput: {
@@ -457,14 +455,6 @@ describe("codex formatter (#845)", () => {
 
 // ─── Codex capability detection (#845) ───────────────────
 describe("codexSupportsUpdatedInput (#845)", () => {
-  let dir: string;
-  let cachePath: string;
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "cm-codex-caps-"));
-    cachePath = join(dir, "caps.json");
-  });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
-
   it("parseCodexVersion parses the version line, null on garbage", () => {
     expect(parseCodexVersion("codex-cli 0.141.0")).toEqual([0, 141, 0]);
     expect(parseCodexVersion("codex 0.139.2\n")).toEqual([0, 139, 2]);
@@ -477,25 +467,22 @@ describe("codexSupportsUpdatedInput (#845)", () => {
     expect(versionGte([1, 0, 0], [0, 141, 0])).toBe(true);
   });
 
-  it("true for a supported version, false (fail closed) for older", () => {
-    expect(codexSupportsUpdatedInput({ runVersion: () => "codex-cli 0.141.0", now: () => 1000, cachePath })).toBe(true);
-    rmSync(cachePath, { force: true });
-    expect(codexSupportsUpdatedInput({ runVersion: () => "codex-cli 0.140.0", now: () => 1000, cachePath })).toBe(false);
+  it("fails closed without actual running-host evidence", () => {
+    expect(codexSupportsUpdatedInput()).toBe(false);
   });
 
-  it("fails closed when codex is absent / probe throws", () => {
-    expect(
-      codexSupportsUpdatedInput({ runVersion: () => { throw new Error("ENOENT"); }, now: () => 1000, cachePath }),
-    ).toBe(false);
+  it("a modern independent CLI cannot enable command rewriting", () => {
+    let calls = 0;
+    expect(codexSupportsUpdatedInput({ runVersion: () => { calls++; return "codex-cli 99.999.0"; } })).toBe(false);
+    expect(calls).toBe(0);
   });
 
-  it("serves a fresh cached result without re-probing, re-probes after TTL", () => {
-    codexSupportsUpdatedInput({ runVersion: () => "codex-cli 0.141.0", now: () => 1000, cachePath });
-    expect(
-      codexSupportsUpdatedInput({ runVersion: () => { throw new Error("must not run within TTL"); }, now: () => 1000 + 60_000, cachePath }),
-    ).toBe(true);
-    expect(
-      codexSupportsUpdatedInput({ runVersion: () => "codex-cli 0.140.0", now: () => 1000 + 2 * 60 * 60 * 1000, cachePath }),
-    ).toBe(false);
+  it("production guard keeps redirect guidance without an allow/rewrite shape", () => {
+    const out = codexFormat(modifyDecision, {
+      codexSupportsRewrite: codexSupportsUpdatedInput(),
+    }) as { hookSpecificOutput: Record<string, unknown> };
+    expect(out.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(out.hookSpecificOutput.permissionDecisionReason).toContain("curl/wget blocked");
+    expect(out.hookSpecificOutput).not.toHaveProperty("updatedInput");
   });
 });

@@ -304,11 +304,6 @@ export class PolyglotExecutor {
       const filePath = this.#writeScript(tmpDir, code, language);
       const cmd = buildCommand(this.#runtimes, language, filePath);
 
-      // Rust: compile then run
-      if (cmd[0] === "__rust_compile_run__") {
-        return await this.#compileAndRun(filePath, tmpDir, timeout, signal);
-      }
-
       // Every language runs in the project directory so git, relative paths,
       // and other project-aware tools resolve naturally. The script FILE lives
       // in the sandbox tmpDir and is passed to the runtime by absolute path
@@ -321,7 +316,9 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, signal);
+      const result = cmd[0] === "__rust_compile_run__"
+        ? await this.#compileAndRun(filePath, tmpDir, timeout, signal)
+        : await this.#spawn(cmd, cwd, tmpDir, timeout, background, signal);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded && !result.stderr.includes('[termination grace expired]')) {
@@ -405,29 +402,25 @@ export class PolyglotExecutor {
     const binSuffix = isWin ? ".exe" : "";
     const binPath = srcPath.replace(/\.rs$/, "") + binSuffix;
 
-    // Compile — cap rustc invocation at 60s when caller didn't bound the
-    // overall timeout (a hung compile shouldn't run forever even if the
-    // caller is fine with a long-running binary afterwards).
-    try {
-      execFileSync("rustc", [srcPath, "-o", binPath], {
-        cwd,
-        timeout: timeout === undefined ? 60_000 : Math.min(timeout, 60_000),
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? (err as any).stderr || err.message : String(err);
-      return {
-        stdout: "",
-        stderr: `Compilation failed:\n${message}`,
-        exitCode: 1,
-        timedOut: false,
-      };
+    // Keep the event loop responsive during compilation. The same owned
+    // process path handles compiler descendants, timeout and cancellation.
+    // An explicit caller budget covers both phases; it is not reset on run.
+    const started = performance.now();
+    const compile = await this.#spawn(
+      [this.#runtimes.rust ?? "rustc", srcPath, "-o", binPath], cwd, cwd,
+      timeout === undefined ? 60_000 : Math.min(timeout, 60_000), false, signal,
+    );
+    if (compile.exitCode !== 0 || compile.timedOut || compile.cancelled) {
+      return { ...compile, stderr: `Compilation failed:\n${compile.stderr}` };
     }
-
-    // Run
-    signal?.throwIfAborted();
-    return this.#spawn([binPath], cwd, cwd, timeout, false, signal);
+    if (signal?.aborted) {
+      return { stdout: "", stderr: "Compilation completed; execution cancelled.", exitCode: 1, timedOut: false, cancelled: true };
+    }
+    const remaining = timeout === undefined ? undefined : timeout - (performance.now() - started);
+    if (remaining !== undefined && remaining <= 0) {
+      return { stdout: "", stderr: "Compilation exhausted execution timeout.", exitCode: 1, timedOut: true };
+    }
+    return this.#spawn([binPath], cwd, cwd, remaining, false, signal);
   }
 
   async #spawn(

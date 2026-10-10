@@ -1,5 +1,11 @@
 # Windows candidate: Job ownership acceptance, 2026-10-10
 
+**Historical Job-ownership phase.** The current stall-priority changes and
+acceptance are in [windows-stall-closure-20261010.md](windows-stall-closure-20261010.md).
+That report supersedes the old Rust/bootstrap and performance-only blocker
+wording below; this phase's measurements and remaining desktop boundaries stay
+as historical evidence.
+
 The former parent-exits-first orphan and automatic installer-host-death boundary are fixed in source `2860a372eb59a9cee829e32903eaa5573a944e8b` (parent `b518ad98d3e857aa97b85abc2937dc83438cccd1`). The same `codex_windows_latency_candidate` is a reviewable experiment. **Do not replace the active installation yet:** this helper adds substantial short-call latency, and candidate loader/manifest, visible windows hiding, restart/resume acceptance are incomplete. Prior orphan-fail/taskkill descriptions refer to the parent commit, not this release.
 
 ## Scope and exact dependencies

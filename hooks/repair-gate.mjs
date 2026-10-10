@@ -28,10 +28,10 @@ export async function withRepairGate(root,repair,options={}) {
     const ok=await repair();if(ok!==true)throw Error('repair did not produce a loadable dependency');
     rmSync(state,{force:true});return {status:'success',key};
   } catch(error) {
-    const message=String(error?.message??error),temp=state+'.'+process.pid+'-'+Date.now();
-    try {writeFileSync(temp,JSON.stringify({key,at:Date.now(),error:message}));renameSync(temp,state);}
+    const message=String(error?.message??error),temp=state+'.'+process.pid+'-'+Date.now();let failureRecorded=false;
+    try {writeFileSync(temp,JSON.stringify({key,at:Date.now(),error:message}));renameSync(temp,state);failureRecorded=true;}
     catch {try {rmSync(temp,{force:true});} catch {}}
-    return {status:'failure',key,error:message};
+    return {status:'failure',key,error:message,...(options.reportFailureWrite?{failureRecorded}:{})};
   } finally {
     // OS locks span await and release on process death. Never unlink the mutex DB.
     try {db.exec('ROLLBACK');} catch {}

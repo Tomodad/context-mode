@@ -48,20 +48,57 @@ function cachedHelper(hooks,identity=cacheIdentity(hooks)) {
     return exe;
   } catch { return null; }
 }
-export async function prepareWindowsJobHelper() {
+export async function prepareWindowsJobHelper({timeoutMs = 30_000, signal} = {}) {
+  validateDeadline(timeoutMs);
+  if(signal?.aborted) return false;
   if(process.platform!=='win32') return false;
   const hooks=dirname(helperPath()),identity=cacheIdentity(hooks);
   if(!identity) return false;
   if(unavailable.has(identity.key)) return false;
   if(cachedHelper(hooks,identity)) return true;
-  // First build uses the unchanged PowerShell Job path. Its worker/compiler,
-  // writes and publication are all descendants of that owned named Job.
+  // First build uses the PowerShell path. The cache worker and its compiler
+  // run in the named Job once PowerShell has loaded the Job implementation.
+  // Initial Add-Type compilation happens before that Job exists.
   const proc=spawnWindowsOwned(process.execPath,[join(hooks,'windows-job-cache-worker.mjs'),hooks,identity.key,identity.framework],{
     cwd:hooks,env:process.env,jobName:'Local\\ContextModeHelperBuild-'+identity.key,terminateDescendantsOnRootExit:true,
   });
   proc.stdout.resume();proc.stderr.resume();
-  await new Promise(resolveDone=>{proc.once('error',resolveDone);proc.once('close',resolveDone)});
-  return cachedHelper(hooks,identity)!==null;
+  const result=await waitWindowsOwned(proc,{timeoutMs,signal});
+  return !result.terminationUncertain && !result.timedOut && !result.cancelled && result.code===0 && cachedHelper(hooks,identity)!==null;
+}
+function validateDeadline(timeoutMs) {
+  if(!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647) throw new RangeError('Windows owned process deadline must be finite and non-negative');
+}
+export function waitWindowsOwned(proc, {timeoutMs, signal}) {
+  if(!owned.has(proc)) throw new Error('Refusing to wait on an unowned Windows process');
+  validateDeadline(timeoutMs);
+  return new Promise(resolveDone => {
+    let timedOut=false, cancelled=false, error, grace, settled=false;
+    const finish=(code,terminationUncertain=false) => {
+      if(settled) return;settled=true;
+      clearTimeout(timer);clearTimeout(grace);signal?.removeEventListener('abort',stop);
+      proc.removeListener('error',onError);proc.removeListener('close',onClose);
+      if(terminationUncertain) {
+        // Bound even a missing close/failed OS termination. Keep the result
+        // explicitly uncertain; do not publish readiness or release a Job gate.
+        proc.stdin.destroy();proc.stdout.destroy();proc.stderr.destroy();proc.unref();
+        proc.on('error',()=>{});
+      }
+      resolveDone({code,timedOut,cancelled,terminationUncertain,...(error?{error}:{})});
+    };
+    const requestStop=() => {
+      stopWindowsOwned(proc);
+      grace??=setTimeout(()=>finish(null,true),1500);
+    };
+    const stop=() => { cancelled=true; requestStop(); };
+    const timer=setTimeout(() => { timedOut=true; requestStop(); },timeoutMs);
+    const onError=err => { error=err; };
+    const onClose=code=>finish(code);
+    proc.once('error',onError);
+    proc.once('close',onClose);
+    signal?.addEventListener('abort',stop,{once:true});
+    if(signal?.aborted) stop();
+  });
 }
 function binaryRequest(request) {
   const header=Buffer.alloc(4);header.writeInt32LE(0x314a4d43);
