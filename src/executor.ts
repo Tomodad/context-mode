@@ -1,6 +1,6 @@
 import { spawn, execSync, execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readdirSync, lstatSync, unlinkSync, rmdirSync } from "node:fs";
+import { join, resolve, dirname, basename } from "node:path";
 import { tmpdir } from "node:os";
 import {
   detectRuntimes,
@@ -10,6 +10,7 @@ import {
 } from "./runtime.js";
 export type { ExecResult } from "./types.js";
 import type { ExecResult } from "./types.js";
+import { spawnWindowsOwned, stopWindowsOwned } from "../hooks/windows-owned-process.mjs";
 
 const isWin = process.platform === "win32";
 
@@ -191,14 +192,28 @@ function cleanupTmpDir(tmpDir: string): void {
   } catch {
     /* best-effort — OS will reclaim %TEMP% eventually */
   }
+  // Node 24.13's Windows recursive rm may silently retain Unicode paths.
+  // Restrict the fallback to our generated, immediate temp child; never follow
+  // symbolic links/junctions, and leave the original Unix cleanup unchanged.
+  if (!isWin || !existsSync(tmpDir) ||
+      resolve(dirname(tmpDir)).toLowerCase() !== resolve(OS_TMPDIR).toLowerCase() ||
+      !basename(tmpDir).startsWith('.ctx-mode-')) return;
+  const removeOwned = (file: string): void => {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink()) {
+      try { unlinkSync(file); } catch { rmdirSync(file); }
+    } else if (stat.isDirectory()) {
+      for (const entry of readdirSync(file)) removeOwned(join(file,entry));
+      rmdirSync(file);
+    } else unlinkSync(file);
+  };
+  try { removeOwned(tmpDir); } catch { /* a still-held handle remains best effort */ }
 }
 
-/** Kill process tree — on Windows uses taskkill /T; on Unix kills the process group. */
+/** Stop only the owned Windows Job; on Unix kill the process group. */
 function killTree(proc: ReturnType<typeof spawn>): void {
-  if (isWin && proc.pid) {
-    try {
-      execFileSync(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID", String(proc.pid)], { stdio: "pipe", windowsHide: true, timeout: 5000 });
-    } catch { /* already dead */ }
+  if (isWin) {
+    stopWindowsOwned(proc);
   } else if (proc.pid) {
     try {
       // Kill entire process group (negative PID) to prevent orphaned children
@@ -241,8 +256,8 @@ export class PolyglotExecutor {
   #projectRootResolver: () => string;
   #runtimes: RuntimeMap;
 
-  /** PIDs of backgrounded processes — killed on cleanup to prevent zombies. */
-  #backgroundedPids = new Set<number>();
+  /** Keep ownership/control handles, never reopen a potentially reused PID. */
+  #backgroundedProcesses = new Set<ReturnType<typeof spawn>>();
 
   constructor(opts?: {
     hardCapBytes?: number;
@@ -271,13 +286,13 @@ export class PolyglotExecutor {
 
   /** Kill all backgrounded processes to prevent zombie/port-conflict issues. */
   cleanupBackgrounded(): void {
-    for (const pid of this.#backgroundedPids) {
-      try {
-        // Kill process group on Unix to catch all children
-        process.kill(isWin ? pid : -pid, "SIGTERM");
-      } catch { /* already dead */ }
+    for (const proc of this.#backgroundedProcesses) {
+      if (isWin) stopWindowsOwned(proc);
+      else if (proc.pid) {
+        try { process.kill(-proc.pid, "SIGTERM"); } catch { /* already dead */ }
+      }
     }
-    this.#backgroundedPids.clear();
+    this.#backgroundedProcesses.clear();
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
@@ -309,7 +324,7 @@ export class PolyglotExecutor {
       const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, signal);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
-      if (!result.backgrounded) {
+      if (!result.backgrounded && !result.stderr.includes('[termination grace expired]')) {
         cleanupTmpDir(tmpDir);
       }
 
@@ -365,7 +380,11 @@ export class PolyglotExecutor {
       const rewritten = rewriteWindowsBuildTools(code, process.platform);
       const shellCode = isWin && isPowerShell(shellPath)
         ? buildPowerShellScriptContent(rewritten)
-        : rewritten;
+        : isWin && /(?:^|[\\/])cmd(?:\.exe)?$/i.test(shellPath ?? '')
+          // cmd's batch reader loses byte offsets with UTF-8 + LF-only lines,
+          // including an in-script chcp transition. Native batch lines use CRLF.
+          ? rewritten.replace(/\r?\n/g, "\r\n")
+          : rewritten;
       writeFileSync(
         fp,
         buildShellScriptContent(shellCode, process.env.PATH, process.platform),
@@ -434,13 +453,11 @@ export class PolyglotExecutor {
       // while still allowing MSYS_NO_PATHCONV to protect non-ASCII paths in commands.
       let spawnCmd = cmd[0];
       let spawnArgs: string[];
-      if (isWin && cmd.length === 2 && cmd[1]) {
+      if (isWin && /(?:^|[\\/])bash(?:\.exe)?$/i.test(spawnCmd) && cmd.length === 2 && cmd[1]) {
         const posixPath = cmd[1].replace(/\\/g, "/");
         spawnArgs = [posixPath];
       } else {
-        spawnArgs = isWin
-          ? cmd.slice(1).map(a => a.replace(/\\/g, "/"))
-          : cmd.slice(1);
+        spawnArgs = cmd.slice(1);
       }
 
       // Common options shared by both spawn variants below.
@@ -463,7 +480,11 @@ export class PolyglotExecutor {
       // the args-array form of spawn(). Colllapsing to a string avoids the
       // warning while preserving the same shell behavior.
       let proc: ReturnType<typeof spawn>;
-      if (needsShell) {
+      if (isWin) {
+        proc = spawnWindowsOwned(spawnCmd, spawnArgs, {
+          cwd, env: commonOpts.env, shell: needsShell, terminateDescendantsOnRootExit: !background,
+        });
+      } else if (needsShell) {
         const fullCmd = [spawnCmd, ...spawnArgs]
           .map(a => /\s/.test(a) ? JSON.stringify(a) : a)
           .join(" ");
@@ -505,7 +526,7 @@ export class PolyglotExecutor {
           // Background mode: detach process, return partial output, keep running
           resolved = true;
           removeAbort();
-          if (proc.pid) this.#backgroundedPids.add(proc.pid);
+          this.#backgroundedProcesses.add(proc);
           proc.unref();
           // Do NOT destroy stdout/stderr — closing the read end of the pipe
           // sends SIGPIPE to the child on its next write, killing it.
@@ -551,7 +572,7 @@ export class PolyglotExecutor {
           stdoutChunks.push(chunk);
         } else if (!capExceeded) {
           capExceeded = true;
-          killTree(proc);
+          if (isWin) stop(); else killTree(proc);
         }
       });
 
@@ -561,11 +582,12 @@ export class PolyglotExecutor {
           stderrChunks.push(chunk);
         } else if (!capExceeded) {
           capExceeded = true;
-          killTree(proc);
+          if (isWin) stop(); else killTree(proc);
         }
       });
 
       proc.on("close", (exitCode) => {
+        this.#backgroundedProcesses.delete(proc);
         clearTimeout(timer);
         clearTimeout(settleTimer);
         removeAbort();
@@ -591,6 +613,7 @@ export class PolyglotExecutor {
       });
 
       proc.on("error", (err) => {
+        this.#backgroundedProcesses.delete(proc);
         clearTimeout(timer);
         clearTimeout(settleTimer);
         removeAbort();

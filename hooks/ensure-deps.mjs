@@ -64,10 +64,10 @@ function hasModernSqlite() {
   return major > 22 || (major === 22 && minor >= 5);
 }
 
-export async function ensureDeps() {
-  // Bun ships bun:sqlite and never needs better-sqlite3
-  if (typeof globalThis.Bun !== "undefined") return;
-  for (const pkg of NATIVE_DEPS) {
+export async function ensureDeps(packages = NATIVE_DEPS) {
+  for (const pkg of packages) {
+    // Bun needs no native addon, but startup may request pure-JS packages.
+    if (typeof globalThis.Bun !== "undefined" && pkg === 'better-sqlite3') continue;
     const pkgDir = resolve(root, "node_modules", pkg);
     if (!existsSync(pkgDir)) {
       // Package not installed at all.
@@ -97,7 +97,7 @@ export async function ensureDeps() {
         // #861: surface the failure (was silently swallowed); still degrade gracefully.
         process.stderr.write(`[context-mode] ensure-deps install of ${pkg} failed: ${err?.message ?? err}\n`);
       }
-    } else if (!existsSync(resolve(pkgDir, ...NATIVE_BINARIES[pkg]))) {
+    } else if (NATIVE_BINARIES[pkg] && !existsSync(resolve(pkgDir, ...NATIVE_BINARIES[pkg]))) {
       // Package installed but native binary missing (e.g., npm ignore-scripts=true,
       // or Windows where `npm rebuild` falls through to node-gyp without MSVC — #408).
       // Delegate to the shared 3-layer heal (single source of truth, also used by
@@ -117,7 +117,7 @@ export async function ensureDeps() {
  * binary is lazy-loaded when instantiating a Database. We must create an
  * in-memory DB to actually trigger dlopen.
  */
-function probeNativeInChildProcess(pluginRoot) {
+export function probeNativeInChildProcess(pluginRoot) {
   try {
     execFileSync(
       process.execPath,
@@ -323,12 +323,22 @@ const gateBinary = resolve(root, "node_modules", "better-sqlite3", "build", "Rel
 const gateCache = resolve(dirname(gateBinary), `better_sqlite3.abi${process.versions.modules}.node`);
 let alreadyValidated = false;
 try { alreadyValidated = readFileSync(`${gateBinary}.swap-stamp`, "utf8") === nativeSwapStamp(gateCache, gateBinary); } catch {}
-if (alreadyValidated) {
-  ensureNativeCompat(root);
-} else {
-  await withRepairGate(root, async () => {
-    await ensureDeps();
-    ensureNativeCompat(root);
-    return probeNativeInChildProcess(root);
-  });
+// The worker imports this module for its explicit repair functions. It alone
+// owns the SQLite mutex; importing must not recursively start another worker.
+const isRepairWorker = process.argv[1] && resolve(process.argv[1]) === resolve(__dirname, 'repair-worker.mjs');
+const needsWindowsRepair = typeof globalThis.Bun === 'undefined' ? !alreadyValidated : existsSync(gateBinary) && !existsSync(gateCache);
+if (!isRepairWorker && needsWindowsRepair && process.platform === 'win32') {
+  const { runWindowsRepair } = await import('./windows-repair.mjs');
+  const result = await runWindowsRepair(root);
+  if (!['success', 'inflight', 'backoff'].includes(result.status)) {
+    process.stderr.write(`[context-mode] owned repair ${result.status}\n`);
+  }
+} else if (!isRepairWorker && process.platform !== 'win32') {
+  // Preserve the existing non-Windows bootstrap behavior.
+  if (alreadyValidated) ensureNativeCompat(root);
+  else await withRepairGate(root, async () => {
+      await ensureDeps();
+      ensureNativeCompat(root);
+      return probeNativeInChildProcess(root);
+    });
 }

@@ -486,6 +486,13 @@ import "./hooks/ensure-deps.mjs";
 {
   const NPM_INSTALL_BG_PKGS = ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"];
   const IS_WIN32 = process.platform === "win32";
+  if (IS_WIN32 && NPM_INSTALL_BG_PKGS.some(pkg => !existsSync(resolve(__dirname,'node_modules',pkg)))) {
+    // Windows installs must share native repair ownership/exclusion. Awaiting
+    // cold installation costs startup time; ready installs take no helper path.
+    const { runWindowsRepair } = await import('./hooks/windows-repair.mjs');
+    const result = await runWindowsRepair(__dirname, {startupDeps:true});
+    if (!['success','inflight','backoff'].includes(result.status)) process.stderr.write(`[context-mode] startup dependency repair ${result.status}\n`);
+  }
   const NPM_BIN = IS_WIN32 ? "npm.cmd" : "npm";
   const NPM_FLAGS = ["--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"];
   // #861: on Windows the npm shim is `npm.cmd`, which needs `shell: true` to
@@ -500,6 +507,7 @@ import "./hooks/ensure-deps.mjs";
   const NPM_CLI_JS = resolve(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
   const useNodeCli = existsSync(NPM_CLI_JS);
   for (const pkg of NPM_INSTALL_BG_PKGS) {
+    if (IS_WIN32) continue;
     if (existsSync(resolve(__dirname, "node_modules", pkg))) continue;
     try {
       const child = useNodeCli
