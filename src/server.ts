@@ -4,11 +4,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createRequire } from "node:module";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, writeSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync, realpathSync } from "node:fs";
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
-import { join, dirname, resolve, sep, isAbsolute } from "node:path";
+import { join, dirname, basename, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus, platform } from "node:os";
 import { request as httpsRequest } from "node:https";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
@@ -51,6 +52,7 @@ import {
   resolveContentStorageDir,
   resolveDefaultSessionDir,
   resolveSessionDbPath,
+  resolveSessionPath,
   resolveSessionStorageDir,
   resolveStatsStorageDir,
   SessionDB,
@@ -345,14 +347,15 @@ if (suppressMcpToolsForNativePluginHost && process.env.CONTEXT_MODE_EMBEDDED_PLU
 }
 
 type ToolContextOverride = { projectDir: string; sessionId?: string };
-const projectDirOverride = new AsyncLocalStorage<ToolContextOverride>();
+type ToolContext = ToolContextOverride & { statsCache?: { storageKey: string; state: StatsState } };
+const projectDirOverride = new AsyncLocalStorage<ToolContext>();
 
 export async function withProjectDirOverride<T>(
   projectDir: string | ToolContextOverride,
   fn: () => Promise<T>,
 ): Promise<T> {
   const ctx = typeof projectDir === "string" ? { projectDir } : projectDir;
-  return projectDirOverride.run(ctx, fn);
+  return projectDirOverride.run({ projectDir: ctx.projectDir, sessionId: ctx.sessionId }, fn);
 }
 
 // Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
@@ -448,8 +451,11 @@ writeFileSync(
 // snippets under /tmp when the host process exits.
 process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ } });
 
-// Lazy singleton — no DB overhead unless index/search is used
-let _store: ContentStore | null = null;
+// Lazy handles, keyed by the resolved project/platform storage path.
+// An embedded host may serve several projects in one process.
+const stores = new Map<string, ContentStore>();
+const cleanedContentDirs = new Set<string>();
+let cleanedLegacyStores = false;
 
 /**
  * Build the FK-attribution object passed to every ContentStore.index*() call
@@ -461,7 +467,7 @@ let _store: ContentStore | null = null;
  */
 export function currentAttribution(): { sessionId?: string } | undefined {
   const override = projectDirOverride.getStore();
-  if (override?.sessionId) return { sessionId: override.sessionId };
+  if (override) return override.sessionId ? { sessionId: override.sessionId } : undefined;
 
   // CLAUDE_SESSION_ID env var is NOT propagated to MCP servers (only to hooks).
   // Cross-adapter resolution: every adapter (15 of them) sets *_PROJECT_DIR env
@@ -474,18 +480,17 @@ export function currentAttribution(): { sessionId?: string } | undefined {
   return { sessionId };
 }
 
-let __cachedSessionId: { sid: string; checkedAt: number } | undefined;
+const cachedSessionIds = new Map<string, { sid: string; checkedAt: number }>();
 /** v1.0.134 SLICE A: opts injection for testability. Production callers pass nothing. */
 export function resolveSessionIdFromSessionDB(opts?: {
   projectDir?: string;
   sessionsDir?: string;
   bypassCache?: boolean;
 }): string | undefined {
-  // 2s cache — ctx_fetch_and_index can fire 5+ chunks/sec; DB open cost adds up.
+  // Scoped requests never guess a host session from another request or env.
+  const override = projectDirOverride.getStore();
+  if (!opts?.projectDir && override) return override.sessionId;
   const now = Date.now();
-  if (!opts?.bypassCache && __cachedSessionId && now - __cachedSessionId.checkedAt < 2000) {
-    return __cachedSessionId.sid;
-  }
   try {
     const projectDir = opts?.projectDir
       ?? process.env.CLAUDE_PROJECT_DIR
@@ -493,7 +498,12 @@ export function resolveSessionIdFromSessionDB(opts?: {
     if (!projectDir) return undefined;
     const sessionsDir = opts?.sessionsDir ?? getSessionDir();
     const dbPath = resolveSessionDbPath({ projectDir, sessionsDir });
-    if (!existsSync(dbPath)) return undefined;
+    const cached = cachedSessionIds.get(dbPath);
+    if (!opts?.bypassCache && cached && now - cached.checkedAt < 2000) return cached.sid;
+    if (!existsSync(dbPath)) {
+      cachedSessionIds.delete(dbPath);
+      return undefined;
+    }
     const Database = loadDatabase();
     const db = new Database(dbPath, { readonly: true, fileMustExist: true });
     try {
@@ -501,7 +511,8 @@ export function resolveSessionIdFromSessionDB(opts?: {
         "SELECT session_id FROM session_events ORDER BY created_at DESC LIMIT 1"
       ).get() as { session_id?: string } | undefined;
       const sid = row?.session_id;
-      if (sid) __cachedSessionId = { sid, checkedAt: now };
+      if (sid) cachedSessionIds.set(dbPath, { sid, checkedAt: now });
+      else cachedSessionIds.delete(dbPath);
       return sid;
     } finally {
       try { db.close(); } catch { /* best-effort */ }
@@ -512,25 +523,20 @@ export function resolveSessionIdFromSessionDB(opts?: {
 }
 
 /**
- * Auto-index session events files written by SessionStart hook.
- * Scans ~/.claude/context-mode/sessions/ for *-events.md files.
- * CLAUDE_PROJECT_DIR is NOT available to MCP servers — only to hooks —
- * so we glob-scan instead of computing a specific hash.
- * Files are consumed (deleted) after indexing to prevent double-indexing.
- * Called on every getStore() — readdirSync is sub-millisecond when no files match.
+ * Consume only this project's SessionStart event file. The shared resolver
+ * applies the same project hash, worktree suffix and legacy migration as hooks.
+ * A directory-wide scan can consume another project's pending restore.
  */
 function maybeIndexSessionEvents(store: ContentStore): void {
   try {
-    const sessionsDir = getSessionDir();
-    if (!existsSync(sessionsDir)) return;
-    const files = readdirSync(sessionsDir).filter(f => f.endsWith("-events.md"));
-    for (const file of files) {
-      const filePath = join(sessionsDir, file);
-      try {
-        store.index({ path: filePath, source: "session-events", attribution: currentAttribution() });
-        unlinkSync(filePath);
-      } catch { /* best-effort per file */ }
-    }
+    const filePath = resolveSessionPath({
+      projectDir: getProjectDir(),
+      sessionsDir: getSessionDir(),
+      ext: "-events.md",
+    });
+    if (!existsSync(filePath)) return;
+    store.index({ path: filePath, source: "session-events", attribution: currentAttribution() });
+    unlinkSync(filePath);
   } catch { /* best-effort — session continuity never blocks tools */ }
 }
 
@@ -711,18 +717,20 @@ function getStorePath(): string {
 }
 
 function getStore(): ContentStore {
-  if (!_store) {
+  const dbPath = getStorePath();
+  let store = stores.get(dbPath);
+  if (!store) {
+    const projectDir = getProjectDir();
     // Content DB cleanup on fresh start is handled by SessionStart hook.
     // Server just opens whatever DB exists (or creates new if hook deleted it).
-    const dbPath = getStorePath();
-    _store = new ContentStore(dbPath);
+    store = new ContentStore(dbPath);
+    stores.set(dbPath, store);
 
     // Wire deny-policy hook: store re-checks the Read deny list before
     // re-reading any file_path during auto-refresh. Catches policy edits
     // made after a file was originally indexed. See #442 round-3.
-    _store.setDenyChecker((filePath: string) => {
+    store.setDenyChecker((filePath: string) => {
       try {
-        const projectDir = getProjectDir();
         const denyGlobs = readToolDenyPatterns("Read", projectDir);
         const r = evaluateFilePath(
           filePath,
@@ -739,35 +747,87 @@ function getStore(): ContentStore {
 
     // One-time startup cleanup: remove stale content DBs (>14 days)
     try {
-      const contentDir = dirname(getStorePath());
-      cleanupStaleContentDBs(contentDir, 14);
-      _store.cleanupStaleSources(14);
+      const contentDir = dirname(dbPath);
+      if (!cleanedContentDirs.has(contentDir)) {
+        cleanupStaleContentDBs(contentDir, 14);
+        cleanedContentDirs.add(contentDir);
+      }
+      store.cleanupStaleSources(14);
       // Also clean legacy shared dir from before platform isolation
-      const legacyDir = join(homedir(), ".context-mode", "content");
-      if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
+      if (!cleanedLegacyStores) {
+        const legacyDir = join(homedir(), ".context-mode", "content");
+        if (existsSync(legacyDir)) cleanupStaleContentDBs(legacyDir, 0);
+        cleanupStaleDBs();
+        cleanedLegacyStores = true;
+      }
     } catch { /* best-effort */ }
 
-    // Also clean old PID-based DBs from migration
-    cleanupStaleDBs();
   }
-  maybeIndexSessionEvents(_store);
-  return _store;
+  maybeIndexSessionEvents(store);
+  return store;
 }
 
 // ─────────────────────────────────────────────────────────
 // Session stats — track context consumption per tool
 // ─────────────────────────────────────────────────────────
 
-const sessionStats = {
-  calls: {} as Record<string, number>,
-  bytesReturned: {} as Record<string, number>,
-  bytesIndexed: 0,
-  bytesSandboxed: 0, // network I/O consumed inside sandbox (never enters context)
-  cacheHits: 0,
-  cacheMisses: 0, // ctx_fetch_and_index calls that bypassed the TTL cache
-  cacheBytesSaved: 0, // bytes avoided by TTL cache hits
-  sessionStart: Date.now(),
-};
+function createSessionStats() {
+  return {
+    calls: {} as Record<string, number>,
+    bytesReturned: {} as Record<string, number>,
+    bytesIndexed: 0,
+    bytesSandboxed: 0, // network I/O consumed inside sandbox (never enters context)
+    cacheHits: 0,
+    cacheMisses: 0, // ctx_fetch_and_index calls that bypassed the TTL cache
+    cacheBytesSaved: 0, // bytes avoided by TTL cache hits
+    sessionStart: Date.now(),
+  };
+}
+
+interface StatsState {
+  stats: ReturnType<typeof createSessionStats>;
+  sessionDbPath: string;
+  filePath: string;
+  sessionsDir: string;
+  statsStorage: ReturnType<typeof resolveStatsStorageDir>;
+  scoped: boolean;
+  lastPersist: number;
+  lifetimeCache?: { tokens: number; computedAt: number };
+}
+const statsStates = new Map<string, StatsState>();
+
+function getStatsState(): StatsState {
+  const context = projectDirOverride.getStore();
+  // Paths are resolved once per scoped invocation. The cheap directory key
+  // invalidates the cache if a host/test changes storage configuration mid-call.
+  const sessionStorage = resolveSessionStorageDir(getDefaultSessionDir);
+  const statsStorage = resolveStatsStorageDir(getDefaultSessionDir);
+  const storageKey = context ? JSON.stringify([
+    sessionStorage.path,
+    statsStorage.path,
+    process.env.CONTEXT_MODE_SESSION_SUFFIX,
+  ]) : undefined;
+  if (context?.statsCache && context.statsCache.storageKey === storageKey) {
+    const cached = context.statsCache.state;
+    if (statsStates.get(JSON.stringify([cached.sessionDbPath, cached.filePath])) === cached) return cached;
+  }
+  // In-memory accounting must still work when persistence is unavailable.
+  const sessionDbPath = resolveSessionDbPath({ projectDir: getProjectDir(), sessionsDir: sessionStorage.path });
+  const filePath = getStatsFilePath(statsStorage.path, sessionDbPath);
+  const key = JSON.stringify([sessionDbPath, filePath]);
+  let state = statsStates.get(key);
+  if (!state) {
+    state = { stats: createSessionStats(), sessionDbPath, filePath,
+      sessionsDir: sessionStorage.path, statsStorage, scoped: !!context, lastPersist: 0 };
+    statsStates.set(key, state);
+  }
+  if (context && storageKey !== undefined) context.statsCache = { storageKey, state };
+  return state;
+}
+
+function getSessionStats(): ReturnType<typeof createSessionStats> {
+  return getStatsState().stats;
+}
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -897,6 +957,23 @@ function healCacheMidSession(): void {
   } catch { /* best effort */ }
 }
 
+type SessionWriteContext = { sessionId?: string | null; projectDir?: string };
+
+/** Capture paths before deferring so a later request cannot redirect a write. */
+function scheduleSessionWrite(write: (dbPath: string, context: SessionWriteContext) => void): void {
+  try {
+    const override = projectDirOverride.getStore();
+    if (override && !override.sessionId) return;
+    const dbPath = getSessionDbPath();
+    const context: SessionWriteContext = override
+      ? { sessionId: override.sessionId, projectDir: override.projectDir }
+      : {};
+    setImmediate(() => {
+      try { write(dbPath, context); } catch { /* best-effort */ }
+    });
+  } catch { /* best-effort — storage errors never break response accounting */ }
+}
+
 function trackResponse(toolName: string, response: ToolResult): ToolResult {
   // #854: a response is activity too — refresh the bridge-child idle clock so a
   // chatty/streaming call keeps its server alive even between inbound frames.
@@ -915,6 +992,8 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
     (sum, c) => sum + Buffer.byteLength(c.text),
     0,
   );
+  const statsState = getStatsState();
+  const sessionStats = statsState.stats;
   sessionStats.calls[toolName] = (sessionStats.calls[toolName] || 0) + 1;
   sessionStats.bytesReturned[toolName] =
     (sessionStats.bytesReturned[toolName] || 0) + bytes;
@@ -923,13 +1002,13 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
   // bin/statusline.mjs (and any external dashboard) so they don't have to
   // open the SQLite database. Throttled inside persistStats() (500ms) so
   // it's safe to call on every response.
-  persistStats();
+  persistStats(statsState);
 
   // Persist to SessionDB so counters survive process restart, --continue,
   // upgrade. Re-introduces the write path 4742160 added and b392c2f dropped.
   // setImmediate keeps this off the response hot path; the helper itself
   // is best-effort (never throws).
-  setImmediate(() => persistToolCallCounter(getSessionDbPath(), toolName, bytes));
+  scheduleSessionWrite((dbPath, context) => persistToolCallCounter(dbPath, toolName, bytes, context));
 
   // D2 Phase 5/7 — sandbox-execute event emission. Tracks the bytes the
   // user actually saw from sandboxed runs so getRealBytesStats() can
@@ -940,9 +1019,10 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
     || toolName === "ctx_execute_file"
     || toolName === "ctx_batch_execute"
   ) {
-    setImmediate(() =>
+    scheduleSessionWrite((dbPath, context) =>
       emitSandboxExecuteEvent({
-        sessionDbPath: getSessionDbPath(),
+        sessionDbPath: dbPath,
+        ...context,
         toolName,
         bytesReturned: bytes,
       })
@@ -956,23 +1036,27 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
   // was 0/124454 in prod). Drop the count into a marker keyed by the session
   // DB; the next ordinary-tool PostToolUse consumes it and emits a forwardable
   // bytes_retrieved event. Off the hot path; never throws.
-  if (toolName === "ctx_search" || toolName === "ctx_fetch_and_index") {
-    setImmediate(() => appendRetrievalBytes(getSessionDbPath(), bytes));
+  // Legacy markers have no session discriminator. Scoped hosts must not leave
+  // a marker that a different session in the same project can consume.
+  if (!projectDirOverride.getStore() && (toolName === "ctx_search" || toolName === "ctx_fetch_and_index")) {
+    scheduleSessionWrite((dbPath) => appendRetrievalBytes(dbPath, bytes));
   }
 
   return response;
 }
 
 function trackIndexed(bytes: number, source: string = "unknown"): void {
-  sessionStats.bytesIndexed += bytes;
-  persistStats();
+  const state = getStatsState();
+  state.stats.bytesIndexed += bytes;
+  persistStats(state);
   // D2 Phase 5/7 — index-write event emission. `bytes_avoided` because
   // these are bytes that would have flooded context if the user had
   // Read'd the source instead of indexing.
   if (bytes > 0) {
-    setImmediate(() =>
+    scheduleSessionWrite((dbPath, context) =>
       emitIndexWriteEvent({
-        sessionDbPath: getSessionDbPath(),
+        sessionDbPath: dbPath,
+        ...context,
         source,
         bytesAvoided: bytes,
       })
@@ -1000,8 +1084,6 @@ const LIFETIME_REFRESH_MS = 30_000;
 // Matches the conversion factor in src/session/analytics.ts renderBottomLine:
 // ~1KB per session event ÷ 4 bytes/token = 256 tokens/event.
 const TOKENS_PER_EVENT = 256;
-let _lastStatsPersist = 0;
-let _lifetimeCache: { tokens: number; computedAt: number } | undefined;
 
 /**
  * Resolve the per-session stats file path.
@@ -1023,19 +1105,30 @@ function sanitizeSessionId(raw: string): string {
   return SESSION_ID_RE.test(raw) ? raw : `pid-${process.ppid}`;
 }
 
-function getStatsFilePath(): string {
-  const raw = process.env.CLAUDE_SESSION_ID || `pid-${process.ppid}`;
+function getStatsFilePath(resolvedStatsDir?: string, resolvedSessionDbPath?: string): string {
+  const override = projectDirOverride.getStore();
+  const raw = override ? (override.sessionId || "anonymous") : (process.env.CLAUDE_SESSION_ID || `pid-${process.ppid}`);
   const sessionId = sanitizeSessionId(raw);
-  const statsDir = ensureWritableStorageDir(resolveStatsStorageDir(getDefaultSessionDir));
+  const statsDir = resolvedStatsDir ?? ensureWritableStorageDir(resolveStatsStorageDir(getDefaultSessionDir));
+  // Preserve legacy statusline names; scoped hosts need a project namespace
+  // even when two projects use the same session ID (or no session ID).
+  if (override) {
+    const identity = override.sessionId
+      ? `session-${createHash("sha256").update(override.sessionId).digest("hex").slice(0, 16)}`
+      : "anonymous";
+    const projectKey = basename(resolvedSessionDbPath ?? getSessionDbPath(), ".db");
+    return join(statsDir, `stats-${projectKey}-${identity}.json`);
+  }
   return join(statsDir, `stats-${sessionId}.json`);
 }
 
-function persistStats(): void {
-  const now = Date.now();
-  if (now - _lastStatsPersist < STATS_PERSIST_THROTTLE_MS) return;
-  _lastStatsPersist = now;
-
+function persistStats(state?: StatsState): void {
   try {
+    state ??= getStatsState();
+    const now = Date.now();
+    if (now - state.lastPersist < STATS_PERSIST_THROTTLE_MS) return;
+    state.lastPersist = now;
+    const sessionStats = state.stats;
     const totalReturned = Object.values(sessionStats.bytesReturned).reduce(
       (a, b) => a + b,
       0,
@@ -1059,12 +1152,13 @@ function persistStats(): void {
     // disk (per-project SessionDBs + auto-memory dirs) and is too expensive
     // for the 500ms persist throttle. Refresh every 30s; the statusline
     // doesn't need second-by-second lifetime accuracy.
-    let lifetimeTokens = _lifetimeCache?.tokens ?? 0;
-    if (!_lifetimeCache || now - _lifetimeCache.computedAt > LIFETIME_REFRESH_MS) {
+    let lifetimeTokens = state.lifetimeCache?.tokens ?? 0;
+    // Scoped hosts must not scan other projects or adapters for lifetime data.
+    if (!state.scoped && (!state.lifetimeCache || now - state.lifetimeCache.computedAt > LIFETIME_REFRESH_MS)) {
       try {
-        const life = getLifetimeStats({ sessionsDir: getSessionDir() });
+        const life = getLifetimeStats({ sessionsDir: state.sessionsDir });
         lifetimeTokens = (life?.totalEvents ?? 0) * TOKENS_PER_EVENT;
-        _lifetimeCache = { tokens: lifetimeTokens, computedAt: now };
+        state.lifetimeCache = { tokens: lifetimeTokens, computedAt: now };
       } catch {
         // best-effort — keep stale cache or 0
       }
@@ -1106,12 +1200,20 @@ function persistStats(): void {
       ),
     };
 
-    const filePath = getStatsFilePath();
+    ensureWritableStorageDir(state.statsStorage);
+    const filePath = state.filePath;
     const tmpPath = `${filePath}.tmp`;
     writeFileSync(tmpPath, JSON.stringify(payload));
     renameSync(tmpPath, filePath);
   } catch {
     // best-effort — never break tool calls because of stats persistence
+  }
+}
+
+function persistAllStats(force = false): void {
+  for (const state of statsStates.values()) {
+    if (force) state.lastPersist = 0;
+    persistStats(state);
   }
 }
 
@@ -1128,7 +1230,7 @@ function checkDenyPolicy(
   toolName: string,
 ): ToolResult | null {
   try {
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const policies = readBashPolicies(projectDirOverride.getStore()?.projectDir ?? process.env.CLAUDE_PROJECT_DIR);
     const result = evaluateCommandDenyOnly(command, policies);
     if (result.decision === "deny") {
       return trackResponse(toolName, {
@@ -1157,7 +1259,7 @@ function checkNonShellDenyPolicy(
   try {
     const commands = extractShellCommands(code, language);
     if (commands.length === 0) return null;
-    const policies = readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
+    const policies = readBashPolicies(projectDirOverride.getStore()?.projectDir ?? process.env.CLAUDE_PROJECT_DIR);
     for (const cmd of commands) {
       const result = evaluateCommandDenyOnly(cmd, policies);
       if (result.decision === "deny") {
@@ -1957,7 +2059,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       // Parse sandbox network metrics from stderr
       const netMatch = result.stderr?.match(/__CM_NET__:(\d+)/);
       if (netMatch) {
-        sessionStats.bytesSandboxed += parseInt(netMatch[1]);
+        getSessionStats().bytesSandboxed += parseInt(netMatch[1]);
         // Clean the metric line from stderr
         result.stderr = result.stderr.replace(/\n?__CM_NET__:\d+\n?/g, "");
       }
@@ -1965,7 +2067,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       // Parse sandbox FS read metrics from stderr
       const fsMatch = result.stderr?.match(/__CM_FS__:(\d+)/);
       if (fsMatch) {
-        sessionStats.bytesSandboxed += parseInt(fsMatch[1]);
+        getSessionStats().bytesSandboxed += parseInt(fsMatch[1]);
         result.stderr = result.stderr.replace(/\n?__CM_FS__:\d+\n?/g, "");
       }
 
@@ -2610,7 +2712,7 @@ const searchFloodGuard = new FloodGuard({
  */
 function searchFloodGuardKey(): string {
   try {
-    return currentAttribution()?.sessionId ?? "__default__";
+    return JSON.stringify([getStorePath(), currentAttribution()?.sessionId ?? "__default__"]);
   } catch {
     return "__default__";
   }
@@ -3673,16 +3775,17 @@ EXAMPLE: ctx_fetch_and_index(
       }
       const v = r.value;
       if (v.kind === "cached") {
-        sessionStats.cacheHits++;
-        sessionStats.cacheBytesSaved += v.estimatedBytes;
+        getSessionStats().cacheHits++;
+        getSessionStats().cacheBytesSaved += v.estimatedBytes;
         // D2 Phase 5/7 — cache-hit event emission. `bytes_avoided` is the
         // size of the cached payload that would have re-entered context
         // had the TTL window missed. Best-effort, off the hot path.
         const cachedBytes = v.estimatedBytes;
         const cachedLabel = v.label;
-        setImmediate(() =>
+        scheduleSessionWrite((dbPath, context) =>
           emitCacheHitEvent({
-            sessionDbPath: getSessionDbPath(),
+            sessionDbPath: dbPath,
+            ...context,
             source: cachedLabel,
             bytesAvoided: cachedBytes,
           })
@@ -3695,7 +3798,7 @@ EXAMPLE: ctx_fetch_and_index(
         // Cache miss: the URL was not in the TTL window so we paid the
         // network round-trip + re-indexed. Counted here so ctx_stats can
         // report nominal cache_hit_rate alongside the existing hit metrics.
-        sessionStats.cacheMisses++;
+        getSessionStats().cacheMisses++;
         finalized.push({ kind: "fetched", indexed: indexFetched(v) });
       }
     }
@@ -3971,7 +4074,7 @@ async ({
           concurrency,
           nodeOptsPrefix,
           cwd,
-          onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
+          onFsBytes: (bytes) => { getSessionStats().bytesSandboxed += bytes; },
           includeDisplayOutputs: false,
           signal,
         },
@@ -4125,6 +4228,35 @@ server.registerTool(
     inputSchema: z.object({}),
   },
   async () => {
+    // An explicit project/session context cannot safely use analytics' legacy
+    // latest-session inference or machine-wide lifetime aggregation. Report
+    // only this scope's runtime counters and this project's index snapshot.
+    const override = projectDirOverride.getStore();
+    if (override) {
+      const stats = getSessionStats();
+      const calls = Object.values(stats.calls).reduce((total, count) => total + count, 0);
+      const returned = Object.values(stats.bytesReturned).reduce((total, bytes) => total + bytes, 0);
+      let indexState;
+      try { indexState = getStore().getIndexState(); } catch { /* best effort */ }
+      const lines = [
+        "Scope: current project and request session, since this server started.",
+        `Project: ${getProjectDir()}`,
+        `Calls: ${calls}`,
+        `Bytes returned: ${returned}`,
+        `Bytes indexed: ${stats.bytesIndexed}`,
+        `Bytes sandboxed: ${stats.bytesSandboxed}`,
+        `Cache hits: ${stats.cacheHits}; bytes saved: ${stats.cacheBytesSaved}`,
+        ...Object.entries(stats.calls).map(([tool, count]) => `${tool}: ${count} calls, ${stats.bytesReturned[tool] ?? 0} bytes returned`),
+      ];
+      if (indexState) lines.push(`Project index: ${JSON.stringify(indexState)}`);
+      return trackResponse("ctx_stats", {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        structuredContent: { scope: "project-session-runtime", projectDir: getProjectDir(),
+          sessionId: override.sessionId ?? null,
+          stats: { ...stats, calls: { ...stats.calls }, bytesReturned: { ...stats.bytesReturned } },
+          indexState: indexState ?? null },
+      });
+    }
     // ONE call, ONE source — AnalyticsEngine.queryAll()
     let text: string;
     try {
@@ -4144,7 +4276,7 @@ server.registerTool(
         const sdb = new Database(sessionDbPath, { readonly: true });
         try {
           const engine = new AnalyticsEngine(sdb);
-          const report = engine.queryAll(sessionStats);
+          const report = engine.queryAll(getSessionStats());
           // MCP usage is read-only and cheap; only available when DB exists.
           const mcpUsage = engine.getMcpToolUsage();
           // Lifetime stats span every project's SessionDB + auto-memory dir
@@ -4278,7 +4410,7 @@ server.registerTool(
         // No session DB — build a minimal report from runtime stats only.
         // Lifetime still meaningful (other projects, auto-memory) so include it.
         const engine = new AnalyticsEngine(createMinimalDb());
-        const report = engine.queryAll(sessionStats);
+        const report = engine.queryAll(getSessionStats());
         const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
         if (_detectedAdapter?.name === "Pi") {
           patchPiLifetimeFromStatsFiles(lifetime, getSessionDir());
@@ -4292,7 +4424,7 @@ server.registerTool(
     } catch {
       // Session DB not available or incompatible — build minimal report from runtime stats
       const engine = new AnalyticsEngine(createMinimalDb());
-      const report = engine.queryAll(sessionStats);
+      const report = engine.queryAll(getSessionStats());
       let lifetime;
       try { lifetime = getLifetimeStats({ sessionsDir: getSessionDir() }); } catch { /* never block ctx_stats */ }
       if (_detectedAdapter?.name === "Pi" && lifetime) {
@@ -4723,10 +4855,12 @@ EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
     try {
       storePathForPurge = getStorePath();
     } catch { /* best effort — store path may be unresolvable on fresh install */ }
-    if (_store) {
-      try { _store.cleanup(); } catch { /* best effort */ }
-      _store = null;
+    const store = storePathForPurge ? stores.get(storePathForPurge) : undefined;
+    if (store) {
+      try { store.close(); } catch { /* best effort */ }
+      stores.delete(storePathForPurge!);
     }
+    cachedSessionIds.delete(getSessionDbPath());
 
     // FTS5 store: pass contentDir so purgeSession sweeps BOTH canonical
     // and legacy raw-casing variants (dual-hash, mirrors session events).
@@ -4754,17 +4888,27 @@ EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
     // still belong to other sessions in the same project. Stats reset
     // happens ONLY when scope === "project".
     if (effectiveScope === "project") {
-      // Reset in-memory session stats
-      sessionStats.calls = {};
-      sessionStats.bytesReturned = {};
-      sessionStats.bytesIndexed = 0;
-      sessionStats.bytesSandboxed = 0;
-      sessionStats.cacheHits = 0;
-      sessionStats.cacheBytesSaved = 0;
-      sessionStats.sessionStart = Date.now();
+      const dbPath = getSessionDbPath();
+      for (const [key, state] of statsStates) {
+        if (state.sessionDbPath !== dbPath) continue;
+        statsStates.delete(key);
+        try { if (existsSync(state.filePath)) unlinkSync(state.filePath); } catch { /* best effort */ }
+      }
+      const context = projectDirOverride.getStore();
+      if (context) delete context.statsCache;
       deleted.push("session stats");
-
-      // Also drop the persisted stats file so external readers see a fresh state
+      // Sweep only this project/worktree's scoped sidecars, including ones
+      // written by previous processes and never loaded into statsStates.
+      try {
+        const statsDir = resolveStatsStorageDir(getDefaultSessionDir).path;
+        const prefix = `stats-${basename(dbPath, ".db")}-`;
+        for (const file of readdirSync(statsDir)) {
+          if (file.startsWith(prefix) && (file.endsWith(".json") || file.endsWith(".json.tmp"))) {
+            try { unlinkSync(join(statsDir, file)); } catch { /* best effort */ }
+          }
+        }
+      } catch { /* best effort */ }
+      // The legacy sidecar may also predate this process.
       try {
         const statsFile = getStatsFilePath();
         if (existsSync(statsFile)) unlinkSync(statsFile);
@@ -5040,7 +5184,8 @@ async function main() {
   // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
     executor.cleanupBackgrounded();
-    if (_store) _store.close(); // persist DB for --continue sessions
+    for (const store of stores.values()) store.close(); // persist DB for --continue sessions
+    stores.clear();
     try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
@@ -5053,8 +5198,7 @@ async function main() {
     // (PR #401 grill-me review B1: persistStats early-returns inside throttle
     // window; gracefulShutdown previously did NOT bypass).
     try {
-      _lastStatsPersist = 0;
-      persistStats();
+      persistAllStats(true);
     } catch { /* best effort — never block shutdown */ }
     shutdown();
     process.exit(0);
@@ -5108,6 +5252,9 @@ async function main() {
   // `0 calls / $0.00` until the user makes another MCP tool call. Wrapped
   // in try/catch — a stats-restore failure must never block server startup.
   try {
+    // Materialize the legacy scope even before its first tool call so the
+    // heartbeat continues refreshing an idle standalone server's sidecar.
+    const sessionStats = getSessionStats();
     const restored = restoreSessionStats(getSessionDbPath());
     if (restored) {
       for (const [tool, count] of Object.entries(restored.calls)) {
@@ -5140,7 +5287,7 @@ async function main() {
   // so bin/statusline.mjs falsely flips to "stale — restart to resume saving"
   // even though the server is alive. Heartbeat refreshes updated_at every 60s;
   // statusline staleness threshold is 30min (cliff is 30 missed ticks away).
-  setInterval(() => persistStats(), 60_000).unref();
+  setInterval(() => persistAllStats(), 60_000).unref();
 
   if (process.stdin.isTTY) {
     console.error(`Context Mode MCP server v${VERSION} running on stdio`);

@@ -14,29 +14,33 @@
  * - Best-effort error swallowing matches `persistToolCallCounter` in
  *   `persist-tool-calls.ts`. A stats-side failure must NEVER break the
  *   parent MCP tool call.
- * - Resolves the latest `session_id` from `session_meta` so the wiring
- *   in `server.ts` is `setImmediate(() => emit*({...}))` — no need to
- *   plumb session ids through every handler.
+ * - Scoped callers supply their exact session_id and projectDir. Legacy
+ *   callers without an override still resolve the latest session_meta row.
+ *   An explicit null session disables attribution instead of guessing.
  */
 
 import { existsSync } from "node:fs";
 import { SessionDB } from "./db.js";
 
-/**
- * Open the SessionDB at `dbPath`, find the latest session_id, and run
- * `fn` with both. Wraps everything in try/catch so callers stay
- * fire-and-forget.
- */
-function withLatestSession(
-  dbPath: string,
+interface SessionWriteOptions {
+  sessionDbPath: string;
+  /** null disables attribution; undefined preserves the legacy latest-session lookup. */
+  sessionId?: string | null;
+  projectDir?: string;
+}
+
+/** Run best-effort accounting under an exact session or the legacy latest. */
+function withSession(
+  opts: SessionWriteOptions,
   fn: (db: SessionDB, sessionId: string) => void,
 ): void {
   try {
-    if (!existsSync(dbPath)) return;
-    const sdb = new SessionDB({ dbPath });
+    if (opts.sessionId === null || !existsSync(opts.sessionDbPath)) return;
+    const sdb = new SessionDB({ dbPath: opts.sessionDbPath });
     try {
-      const sid = sdb.getLatestSessionId();
+      const sid = opts.sessionId ?? sdb.getLatestSessionId();
       if (!sid) return;
+      if (opts.sessionId) sdb.ensureSession(sid, opts.projectDir ?? "");
       fn(sdb, sid);
     } finally {
       try { sdb.close(); } catch { /* ignore */ }
@@ -51,12 +55,11 @@ function withLatestSession(
  * `bytesReturned` is the size of the stdout text the user actually saw —
  * the rest of the sandbox output stayed out of context.
  */
-export function emitSandboxExecuteEvent(opts: {
-  sessionDbPath: string;
+export function emitSandboxExecuteEvent(opts: SessionWriteOptions & {
   toolName: string;
   bytesReturned: number;
 }): void {
-  withLatestSession(opts.sessionDbPath, (sdb, sid) => {
+  withSession(opts, (sdb, sid) => {
     sdb.insertEvent(
       sid,
       {
@@ -64,7 +67,7 @@ export function emitSandboxExecuteEvent(opts: {
         category: "sandbox",
         priority: 1,
         data: opts.toolName,
-        project_dir: "",
+        project_dir: opts.projectDir ?? "",
         attribution_source: "server",
         attribution_confidence: 1,
       },
@@ -79,12 +82,11 @@ export function emitSandboxExecuteEvent(opts: {
  * Record a `ctx_index` / `trackIndexed` write — content kept out of
  * context by being chunked into FTS5 instead of returned inline.
  */
-export function emitIndexWriteEvent(opts: {
-  sessionDbPath: string;
+export function emitIndexWriteEvent(opts: SessionWriteOptions & {
   source: string;
   bytesAvoided: number;
 }): void {
-  withLatestSession(opts.sessionDbPath, (sdb, sid) => {
+  withSession(opts, (sdb, sid) => {
     sdb.insertEvent(
       sid,
       {
@@ -92,7 +94,7 @@ export function emitIndexWriteEvent(opts: {
         category: "sandbox",
         priority: 1,
         data: opts.source,
-        project_dir: "",
+        project_dir: opts.projectDir ?? "",
         attribution_source: "server",
         attribution_confidence: 1,
       },
@@ -107,12 +109,11 @@ export function emitIndexWriteEvent(opts: {
  * Record a `ctx_fetch_and_index` TTL cache hit — bytes the user would
  * have spent re-fetching the same URL within the 24h cache window.
  */
-export function emitCacheHitEvent(opts: {
-  sessionDbPath: string;
+export function emitCacheHitEvent(opts: SessionWriteOptions & {
   source: string;
   bytesAvoided: number;
 }): void {
-  withLatestSession(opts.sessionDbPath, (sdb, sid) => {
+  withSession(opts, (sdb, sid) => {
     sdb.insertEvent(
       sid,
       {
@@ -120,7 +121,7 @@ export function emitCacheHitEvent(opts: {
         category: "cache",
         priority: 1,
         data: opts.source,
-        project_dir: "",
+        project_dir: opts.projectDir ?? "",
         attribution_source: "server",
         attribution_confidence: 1,
       },

@@ -24,7 +24,7 @@ import {
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "vitest";
 
@@ -46,6 +46,10 @@ import {
 import { ROUTING_BLOCK } from "../../hooks/routing-block.mjs";
 import { sanitizeSchemaForStrictClients, resolveExecTimeout, AGY_DEFAULT_EXEC_TIMEOUT_MS, REGISTERED_CTX_TOOLS } from "../../src/server.js";
 import { stripJsonComments, parseJsonc } from "../../src/util/jsonc.js";
+import {
+  parseCodexRequestContext, CODEX_SANDBOX_STATE_META_CAPABILITY, CODEX_MCP_CLIENT_NAME,
+  codexSandboxCommand, withCodexRequestContext, getCodexRequestContext, isFullyQualifiedExecutable,
+} from "../../src/codex-sandbox-state.js";
 
 // ─── Shared setup ───────────────────────────────────────────────────────────
 const runtimes = detectRuntimes();
@@ -2370,8 +2374,8 @@ describe("ctx_purge is the sole reset/wipe mechanism", () => {
     expect(purgeMatch).not.toBeNull();
     const purgeBody = purgeMatch![0];
     // 1. Closes the FTS5 knowledge base BEFORE wiping (releases Windows lock)
-    expect(purgeBody).toContain("_store.cleanup()");
-    expect(purgeBody).toContain("_store = null");
+    expect(purgeBody).toContain("store.close()");
+    expect(purgeBody).toContain("stores.delete(storePathForPurge!)");
     // 2. Delegates the on-disk wipe to the purgeSession deep module so all
     //    file-kind sweeps (session DB, events.md, cleanup flag, FTS5 store,
     //    legacy content) flow through ONE code path with uniform dual-hash.
@@ -2380,8 +2384,8 @@ describe("ctx_purge is the sole reset/wipe mechanism", () => {
     expect(purgeBody).toContain("sessionsDir: getSessionDir()");
     expect(purgeBody).toContain("storePath: storePathForPurge");
     // 3. Resets in-memory stats
-    expect(purgeBody).toContain("sessionStats.calls = {}");
-    expect(purgeBody).toContain("sessionStats.sessionStart = Date.now()");
+    expect(purgeBody).toContain("statsStates.delete(key)");
+    expect(purgeBody).toContain("state.sessionDbPath !== dbPath");
     // 4. Confirms with list of deleted items
     expect(purgeBody).toContain("Purged:");
   });
@@ -2869,10 +2873,10 @@ describe("ContentStore purge behavior", () => {
       /server\.registerTool\(\s*"ctx_purge"[\s\S]*?^\);/m,
     )![0];
 
-    // Handler resolves storePath BEFORE the optional _store.cleanup() so
+    // Handler resolves storePath BEFORE the optional store.close() so
     // the disk wipe runs whether _store was open or not.
     const storePathIdx = purgeBody.indexOf("getStorePath()");
-    const storeCleanupIdx = purgeBody.indexOf("_store.cleanup()");
+    const storeCleanupIdx = purgeBody.indexOf("store.close()");
     expect(storePathIdx).toBeGreaterThan(-1);
     expect(storePathIdx).toBeLessThan(storeCleanupIdx === -1 ? Infinity : storeCleanupIdx);
     // Handler always passes storePath into the deep module — that is what
@@ -2958,7 +2962,7 @@ describe("FS read instrumentation", () => {
 
   test("parses __CM_FS__ from stderr and adds to bytesSandboxed", () => {
     expect(serverSrc).toContain("__CM_FS__:(\\d+)");
-    expect(serverSrc).toContain("sessionStats.bytesSandboxed += parseInt(fsMatch[1])");
+    expect(serverSrc).toContain("getSessionStats().bytesSandboxed += parseInt(fsMatch[1])");
   });
 
   test("cleans __CM_FS__ marker from stderr output", () => {
@@ -2990,8 +2994,8 @@ describe("batch_execute FS read tracking", () => {
 
   test("parses __CM_FS__ from batch output and updates bytesSandboxed", () => {
     expect(serverSrc).toContain("/__CM_FS__:(\\d+)/g");
-    // Handler wires the FS-bytes callback to sessionStats; the runner strips/parses.
-    expect(serverSrc).toContain("sessionStats.bytesSandboxed += bytes");
+    // Handler wires the FS-bytes callback to scoped stats; the runner strips/parses.
+    expect(serverSrc).toContain("getSessionStats().bytesSandboxed += bytes");
     expect(serverSrc).toContain("onFsBytes?.(cmdFsBytes)");
   });
 
@@ -4975,7 +4979,9 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
       "../../src/session/db.js"
     );
 
-    const sessionsDir = mkdtempSync(join(tmpdir(), "slice-a-sessions-"));
+    const storageRoot = mkdtempSync(join(tmpdir(), "slice-a-sessions-"));
+    const sessionsDir = join(storageRoot, "sessions");
+    mkdirSync(sessionsDir);
     const projectDir = mkdtempSync(join(tmpdir(), "slice-a-proj-"));
     try {
       const dbPath = resolveSessionDbPath({ projectDir, sessionsDir });
@@ -5005,6 +5011,8 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
       const prevSid = process.env.CLAUDE_SESSION_ID;
       const prevProjDir = process.env.CLAUDE_PROJECT_DIR;
       const prevCmProjDir = process.env.CONTEXT_MODE_PROJECT_DIR;
+      const prevStorageRoot = process.env.CONTEXT_MODE_DIR;
+      process.env.CONTEXT_MODE_DIR = storageRoot;
       delete process.env.CLAUDE_SESSION_ID;
       delete process.env.CLAUDE_PROJECT_DIR;
       delete process.env.CONTEXT_MODE_PROJECT_DIR;
@@ -5017,28 +5025,21 @@ describe("v1.0.134 SLICE A — cross-adapter currentAttribution session DB fallb
         });
         expect(sid).toBe(expectedSid);
 
-        // currentAttribution wraps it the same way for prod callers — when the
-        // env var is unset it must surface the DB-resolved sid via the
-        // wrapper too. We re-set CONTEXT_MODE_PROJECT_DIR so the wrapper's
-        // own (cache-bypassed by 2s window starting fresh) call also resolves.
+        // The production wrapper must resolve the same project AND storage
+        // root. The old global cache let this pass with a different sessions
+        // directory, inadvertently relying on the isolation bug.
         process.env.CONTEXT_MODE_PROJECT_DIR = projectDir;
-        // Wait long enough that the previous lookup's 2s cache won't shadow
-        // the wrapper's own resolveSessionIdFromSessionDB call (env-driven path).
-        // Easier: bypass via a direct call shape — the wrapper just composes.
-        const attr = currentAttribution();
-        // Either the env-resolved path returned the same sid, or — if cache
-        // beat us — at least it's not the empty/undefined case. The hard
-        // assertion is the DB lookup above; here we only confirm the
-        // wrapper's contract (returns { sessionId } when sid resolves).
-        expect(attr?.sessionId).toBeTruthy();
+        expect(currentAttribution()).toEqual({ sessionId: expectedSid });
       } finally {
+        if (prevStorageRoot === undefined) delete process.env.CONTEXT_MODE_DIR;
+        else process.env.CONTEXT_MODE_DIR = prevStorageRoot;
         if (prevSid !== undefined) process.env.CLAUDE_SESSION_ID = prevSid;
         if (prevProjDir !== undefined) process.env.CLAUDE_PROJECT_DIR = prevProjDir;
         if (prevCmProjDir !== undefined) process.env.CONTEXT_MODE_PROJECT_DIR = prevCmProjDir;
         else delete process.env.CONTEXT_MODE_PROJECT_DIR;
       }
     } finally {
-      try { rmSync(sessionsDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      try { rmSync(storageRoot, { recursive: true, force: true }); } catch { /* ignore */ }
       try { rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
   });
@@ -6714,5 +6715,424 @@ describe("ctx_* MCP tool annotations (#846)", () => {
     ]) {
       expect(find(name)!.config.annotations!.readOnlyHint).toBe(false);
     }
+  });
+});
+
+// Real tools run in a child with an isolated home, storage root, and temp dir.
+// Never consult the developer's transcripts/session DBs during these checks.
+describe("request-scoped project isolation", () => {
+  function runIsolatedScenario(scenario: string): void {
+    const root = mkdtempSync(join(tmpdir(), "cm-project-isolation-"));
+    for (const directory of ["home", "tmp", "storage", "legacy", "project-a", "project-b"]) {
+      mkdirSync(join(root, directory), { recursive: true });
+    }
+    const bootstrap = `
+      import assert from 'node:assert/strict';
+      import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      import { pathToFileURL } from 'node:url';
+      const { REGISTERED_CTX_TOOLS, withProjectDirOverride, currentAttribution,
+        getProjectDir, resolveSessionIdFromSessionDB } = await import(pathToFileURL(${JSON.stringify(resolve(__dirname, "../../src/server.ts"))}).href);
+      const { SessionDB, resolveSessionDbPath, resolveSessionPath, resolveContentStorePath,
+        hashProjectDirCanonical } = await import(pathToFileURL(${JSON.stringify(resolve(__dirname, "../../src/session/db.ts"))}).href);
+      const { loadDatabase } = await import(pathToFileURL(${JSON.stringify(resolve(__dirname, "../../src/db-base.ts"))}).href);
+      const root = ${JSON.stringify(root)};
+      const a = join(root, 'project-a'), b = join(root, 'project-b');
+      const sessionsDir = join(root, 'storage', 'sessions');
+      mkdirSync(sessionsDir, { recursive: true });
+      const pause = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
+      const flush = () => new Promise(resolve => setImmediate(resolve));
+      const tool = async (name, args) => {
+        const registered = REGISTERED_CTX_TOOLS.find(t => t.name === name);
+        assert.ok(registered, name);
+        const result = await registered.handler(args);
+        assert.notEqual(result.isError, true, JSON.stringify(result));
+        return result.content.map(c => c.text).join('\\n');
+      };
+      const scoped = (projectDir, fn, sessionId = 'shared-session-id') =>
+        withProjectDirOverride({ projectDir, sessionId }, fn);
+      const seed = (projectDir, sessionId) => {
+        const dbPath = resolveSessionDbPath({ projectDir, sessionsDir });
+        const db = new SessionDB({ dbPath });
+        db.ensureSession(sessionId, projectDir);
+        db.insertEvent(sessionId, { type: 'test', category: 'test', priority: 1,
+          data: 'seed ' + sessionId, project_dir: projectDir }, 'test');
+        db.close();
+        return dbPath;
+      };
+    `;
+    try {
+      const proc = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", bootstrap + scenario], {
+        cwd: resolve(__dirname, "../.."),
+        encoding: "utf8",
+        timeout: 30_000,
+        maxBuffer: 2 * 1024 * 1024,
+        env: {
+          ...process.env,
+          HOME: join(root, "home"),
+          USERPROFILE: join(root, "home"),
+          TMPDIR: join(root, "tmp"),
+          TMP: join(root, "tmp"),
+          TEMP: join(root, "tmp"),
+          CODEX_HOME: join(root, "home", ".codex"),
+          CLAUDE_CONFIG_DIR: join(root, "home", ".claude"),
+          CLAUDE_PROJECT_DIR: join(root, "legacy"),
+          CONTEXT_MODE_PROJECT_DIR: join(root, "legacy"),
+          CONTEXT_MODE_DIR: join(root, "storage"),
+          CONTEXT_MODE_SESSION_SUFFIX: "",
+          CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS: "1",
+          CLAUDE_SESSION_ID: "legacy-environment-session",
+          CONTEXT_MODE_SEARCH_BLOCK_AFTER: "8",
+          CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER: "3",
+          CONTEXT_MODE_SEARCH_WINDOW_MS: "60000",
+        },
+      });
+      expect(proc.error, `${proc.stdout}\n${proc.stderr}`).toBeUndefined();
+      expect(proc.status, `${proc.stdout}\n${proc.stderr}`).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test("concurrent index, search, execute and throttling stay in their project", () => {
+    runIsolatedScenario(`
+      writeFileSync(join(a, 'marker.txt'), 'ONLY_PROJECT_ALPHA');
+      writeFileSync(join(b, 'marker.txt'), 'ONLY_PROJECT_BRAVO');
+      let arrivals = 0, release;
+      const barrier = new Promise(resolve => { release = resolve; });
+      await Promise.all([[a, 'ALPHA', 'BRAVO'], [b, 'BRAVO', 'ALPHA']].map(([project, own, other]) =>
+        scoped(project, async () => {
+          await tool('ctx_index', { content: 'isolationneedle ONLY_PROJECT_' + own, source: 'same-source' });
+          if (++arrivals === 2) release();
+          await barrier;
+          const executed = await tool('ctx_execute', { language: 'shell', code: 'cat marker.txt', timeout: 5000 });
+          assert.ok(executed.includes('ONLY_PROJECT_' + own), executed);
+          assert.ok(!executed.includes('ONLY_PROJECT_' + other), executed);
+          // Ten searches in total exceed one shared bucket but not two project buckets.
+          for (let i = 0; i < 5; i++) {
+            await pause();
+            const found = await tool('ctx_search', { queries: ['isolationneedle'], source: 'same-source' });
+            assert.ok(found.includes('ONLY_PROJECT_' + own), found);
+            assert.ok(!found.includes('ONLY_PROJECT_' + other), found);
+          }
+        })
+      ));
+      await flush();
+      const Database = loadDatabase();
+      for (const [project, marker] of [[a, 'ALPHA'], [b, 'BRAVO']]) {
+        const db = new Database(resolveContentStorePath({ projectDir: project, contentDir: join(root, 'storage', 'content') }));
+        const rows = db.prepare('SELECT content, session_id FROM chunks').all();
+        assert.ok(rows.some(row => row.content.includes('ONLY_PROJECT_' + marker)));
+        assert.ok(rows.every(row => row.session_id === 'shared-session-id'));
+        db.close();
+      }
+    `);
+  });
+
+  test("restores nested and interleaved contexts after success and rejection", () => {
+    runIsolatedScenario(`
+      const baseline = getProjectDir();
+      const baselineAttribution = currentAttribution();
+      await Promise.all([
+        scoped(a, async () => {
+          await pause(5);
+          assert.equal(getProjectDir(), a);
+          await assert.rejects(scoped(b, async () => {
+            await pause(5);
+            assert.equal(getProjectDir(), b);
+            assert.deepEqual(currentAttribution(), { sessionId: 'nested' });
+            throw new Error('expected nested error');
+          }, 'nested'), /expected nested error/);
+          assert.equal(getProjectDir(), a);
+          assert.deepEqual(currentAttribution(), { sessionId: 'outer-a' });
+        }, 'outer-a'),
+        scoped(b, async () => {
+          await pause(20);
+          assert.equal(getProjectDir(), b);
+          assert.deepEqual(currentAttribution(), { sessionId: 'outer-b' });
+        }, 'outer-b')
+      ]);
+      assert.equal(getProjectDir(), baseline);
+      assert.deepEqual(currentAttribution(), baselineAttribution);
+      await withProjectDirOverride(a, async () => {
+        assert.equal(currentAttribution(), undefined, 'anonymous override must not inherit environment session');
+        assert.equal(resolveSessionIdFromSessionDB(), undefined, 'anonymous override must not infer latest session');
+      });
+    `);
+  });
+
+  test("only consumes the matching project event file, preserving other projects", () => {
+    runIsolatedScenario(`
+      const eventsA = resolveSessionPath({ projectDir: a, sessionsDir, ext: '-events.md' });
+      const eventsB = resolveSessionPath({ projectDir: b, sessionsDir, ext: '-events.md' });
+      writeFileSync(eventsA, '# Events\\nrestoremarker ONLY_PROJECT_ALPHA');
+      writeFileSync(eventsB, '# Events\\nrestoremarker ONLY_PROJECT_BRAVO');
+      const first = await scoped(a, () => tool('ctx_search', { queries: ['restoremarker'], source: 'session-events' }));
+      assert.ok(first.includes('ONLY_PROJECT_ALPHA'), first);
+      assert.ok(!first.includes('ONLY_PROJECT_BRAVO'), first);
+      assert.equal(existsSync(eventsA), false);
+      assert.equal(existsSync(eventsB), true);
+      const second = await scoped(b, () => tool('ctx_search', { queries: ['restoremarker'], source: 'session-events' }));
+      assert.ok(second.includes('ONLY_PROJECT_BRAVO'), second);
+      assert.ok(!second.includes('ONLY_PROJECT_ALPHA'), second);
+      assert.equal(existsSync(eventsB), false);
+    `);
+  });
+
+  test("store deny checks remain bound to their original project outside its context", () => {
+    runIsolatedScenario(`
+      const { ContentStore } = await import(pathToFileURL(${JSON.stringify(resolve(__dirname, "../../src/store.ts"))}).href);
+      const original = ContentStore.prototype.setDenyChecker;
+      const checkers = [];
+      ContentStore.prototype.setDenyChecker = function(checker) {
+        checkers.push(checker);
+        return original.call(this, checker);
+      };
+      writeFileSync(join(a, 'secret.txt'), 'original safe file');
+      await scoped(a, () => tool('ctx_index', { path: 'secret.txt' }));
+      mkdirSync(join(a, '.claude'), { recursive: true });
+      writeFileSync(join(a, '.claude', 'settings.json'), JSON.stringify({ permissions: { deny: ['Read(' + join(a, 'secret.txt') + ')'] } }));
+      await scoped(b, async () => {
+        assert.equal(checkers[0](join(a, 'secret.txt')), true);
+      });
+      assert.equal(checkers[0](join(a, 'secret.txt')), true);
+    `);
+  });
+
+  test("changing storage roots selects new stores and stats without stale scoped caches", () => {
+    runIsolatedScenario(`
+      const firstRoot = process.env.CONTEXT_MODE_DIR;
+      const secondRoot = join(root, 'storage-two');
+      await scoped(a, async () => {
+        await tool('ctx_index', { content: 'storageword FIRST_STORAGE_ONLY', source: 'same-source' });
+        process.env.CONTEXT_MODE_DIR = secondRoot;
+        await tool('ctx_index', { content: 'storageword SECOND_STORAGE_ONLY', source: 'same-source' });
+        const second = await tool('ctx_search', { queries: ['storageword'], source: 'same-source' });
+        assert.ok(second.includes('SECOND_STORAGE_ONLY'), second);
+        assert.ok(!second.includes('FIRST_STORAGE_ONLY'), second);
+        process.env.CONTEXT_MODE_DIR = firstRoot;
+        const first = await tool('ctx_search', { queries: ['storageword'], source: 'same-source' });
+        assert.ok(first.includes('FIRST_STORAGE_ONLY'), first);
+        assert.ok(!first.includes('SECOND_STORAGE_ONLY'), first);
+      });
+      const secondFiles = readdirSync(join(secondRoot, 'sessions')).filter(file => file.startsWith('stats-'));
+      assert.equal(secondFiles.length, 1);
+    `);
+  });
+
+  test("unavailable session storage never replaces successful execute or index results", () => {
+    runIsolatedScenario(`
+      const { rmSync } = await import('node:fs');
+      rmSync(sessionsDir, { recursive: true });
+      writeFileSync(sessionsDir, 'not a directory');
+      await Promise.all([a, b].map(project => scoped(project, async () => {
+        const executed = await tool('ctx_execute', { language: 'javascript', code: 'console.log("execution succeeded")', timeout: 5000 });
+        assert.ok(executed.includes('execution succeeded'), executed);
+        await tool('ctx_index', { content: 'storagefailureword ' + project, source: 'available-content' });
+        const found = await tool('ctx_search', { queries: ['storagefailureword'], source: 'available-content' });
+        assert.ok(found.includes(project), found);
+      })));
+      await flush();
+      assert.equal(readFileSync(sessionsDir, 'utf8'), 'not a directory');
+    `);
+  });
+
+  test("purging one session or project preserves other live stores", () => {
+    runIsolatedScenario(`
+      await scoped(a, () => tool('ctx_index', { content: 'purgeword SESSION_ONE', source: 'one' }), 'one');
+      await scoped(a, () => tool('ctx_index', { content: 'purgeword SESSION_TWO', source: 'two' }), 'two');
+      await scoped(b, () => tool('ctx_index', { content: 'purgeword PROJECT_B', source: 'b' }));
+      await scoped(a, () => tool('ctx_purge', { confirm: true, scope: 'session', sessionId: 'one' }), 'two');
+      const remaining = await scoped(a, () => tool('ctx_search', { queries: ['purgeword'] }), 'two');
+      assert.ok(remaining.includes('SESSION_TWO'), remaining);
+      assert.ok(!remaining.includes('SESSION_ONE'), remaining);
+      const oldA = join(sessionsDir, 'stats-' + hashProjectDirCanonical(a) + '-session-old-process.json');
+      const oldB = join(sessionsDir, 'stats-' + hashProjectDirCanonical(b) + '-session-old-process.json');
+      writeFileSync(oldA, '{}'); writeFileSync(oldB, '{}');
+      await scoped(a, () => tool('ctx_purge', { confirm: true, scope: 'project' }), 'two');
+      assert.equal(existsSync(oldA), false);
+      assert.equal(existsSync(oldB), true);
+      const untouched = await scoped(b, () => tool('ctx_search', { queries: ['purgeword'] }));
+      assert.ok(untouched.includes('PROJECT_B'), untouched);
+    `);
+  });
+
+  test("scoped stats exclude environment/latest-session and cross-project history", () => {
+    runIsolatedScenario(`
+      const dbPath = seed(a, 'legacy-environment-session');
+      const db = new SessionDB({ dbPath });
+      db.insertEvent('legacy-environment-session', { type: 'user-prompt', category: 'user-prompt', priority: 1,
+        data: 'SECRET_LATEST_SESSION_MARKER', project_dir: a }, 'test');
+      db.close();
+      seed(b, 'SECRET_OTHER_PROJECT_SESSION');
+      await scoped(a, () => tool('ctx_index', { content: 'scoped stats alpha', source: 'a' }), 'request-a');
+      await scoped(b, () => tool('ctx_execute', { language: 'javascript', code: 'console.log("bravo")', timeout: 5000 }), 'request-b');
+      await flush();
+      const reports = await Promise.all([
+        scoped(a, () => tool('ctx_stats', {}), 'request-a'),
+        scoped(b, () => tool('ctx_stats', {}), 'request-b'),
+        withProjectDirOverride(a, () => tool('ctx_stats', {})),
+      ]);
+      for (const report of reports) {
+        assert.ok(report.includes('Scope: current project and request session'), report);
+        assert.ok(!report.includes('SECRET_LATEST_SESSION_MARKER'), report);
+        assert.ok(!report.includes('SECRET_OTHER_PROJECT_SESSION'), report);
+        assert.ok(!report.includes('All your work everywhere'), report);
+      }
+      assert.ok(reports[0].includes('ctx_index'), reports[0]);
+      assert.ok(!reports[0].includes('ctx_execute'), reports[0]);
+      assert.ok(reports[1].includes('ctx_execute'), reports[1]);
+      assert.ok(!reports[1].includes('ctx_index'), reports[1]);
+      assert.ok(!reports[2].includes('ctx_index'), reports[2]);
+      const sidecars = readdirSync(sessionsDir).filter(file => file.startsWith('stats-'));
+      for (const file of sidecars) assert.equal(JSON.parse(readFileSync(join(sessionsDir, file), 'utf8')).tokens_saved_lifetime, 0);
+    `);
+  });
+
+  test("session lookup caches use the resolved project and storage path", () => {
+    runIsolatedScenario(`
+      seed(a, 'session-a'); seed(b, 'session-b');
+      assert.equal(resolveSessionIdFromSessionDB({ projectDir: a, sessionsDir }), 'session-a');
+      assert.equal(resolveSessionIdFromSessionDB({ projectDir: b, sessionsDir }), 'session-b');
+      assert.equal(resolveSessionIdFromSessionDB({ projectDir: a, sessionsDir }), 'session-a');
+      const otherSessions = join(root, 'other-storage');
+      mkdirSync(otherSessions);
+      const otherPath = resolveSessionDbPath({ projectDir: a, sessionsDir: otherSessions });
+      const db = new SessionDB({ dbPath: otherPath });
+      db.ensureSession('other-storage-session', a);
+      db.insertEvent('other-storage-session', { type: 'test', category: 'test', priority: 1, data: 'other storage' }, 'test');
+      db.close();
+      assert.equal(resolveSessionIdFromSessionDB({ projectDir: a, sessionsDir: otherSessions }), 'other-storage-session');
+    `);
+  });
+
+  test("stats and deferred counters use exact sessions and skip anonymous attribution", () => {
+    runIsolatedScenario(`
+      const pathA = seed(a, 'unrelated-latest-a'), pathB = seed(b, 'unrelated-latest-b');
+      await Promise.all([[a, 'session-a', 'alpha'], [b, 'session-b', 'bravo data is longer']].map(([project, sid, content]) =>
+        scoped(project, () => tool('ctx_index', { content, source: 'stats-source' }), sid)
+      ));
+      await flush();
+      const files = readdirSync(sessionsDir).filter(file => file.startsWith('stats-') && file.endsWith('.json'));
+      assert.equal(files.length, 2, 'separate project stats sidecars');
+      const payloads = files.map(file => JSON.parse(readFileSync(join(sessionsDir, file), 'utf8')));
+      assert.deepEqual(payloads.map(p => p.bytes_indexed).sort((a, b) => a - b), [5, 20]);
+      writeFileSync(join(a, 'bytes.txt'), 'A'.repeat(13));
+      writeFileSync(join(b, 'bytes.txt'), 'B'.repeat(53));
+      await pause(550); // Advance each sidecar past its independent persist throttle.
+      await Promise.all([[a, 'session-a'], [b, 'session-b']].map(([project, sid]) =>
+        scoped(project, () => tool('ctx_execute', { language: 'javascript', timeout: 5000,
+          code: 'console.log(require("fs").readFileSync(' + JSON.stringify(join(project, 'bytes.txt')) + ', "utf8"))' }), sid)
+      ));
+      await flush();
+      const updated = files.map(file => JSON.parse(readFileSync(join(sessionsDir, file), 'utf8')));
+      assert.deepEqual(updated.map(p => p.bytes_sandboxed).sort((a, b) => a - b), [13, 53]);
+      assert.ok(updated.every(p => p.by_tool.ctx_index.calls === 1 && p.by_tool.ctx_execute.calls === 1));
+      for (const [path, sid, unrelated] of [[pathA, 'session-a', 'unrelated-latest-a'], [pathB, 'session-b', 'unrelated-latest-b']]) {
+        const db = new SessionDB({ dbPath: path });
+        assert.equal(db.getToolCallStats(sid).byTool.ctx_index.calls, 1);
+        assert.equal(db.getToolCallStats(unrelated).totalCalls, 0);
+        assert.ok(db.getEventBytesSummary(sid).bytesAvoided > 0);
+        assert.ok(db.getEventBytesSummary(sid).bytesReturned > 0);
+        assert.equal(db.getEventBytesSummary(unrelated).bytesAvoided, 0);
+        db.close();
+      }
+      await withProjectDirOverride(a, () => tool('ctx_index', { content: 'anonymous', source: 'anonymous' }));
+      await flush();
+      const db = new SessionDB({ dbPath: pathA });
+      assert.equal(db.getToolCallStats('unrelated-latest-a').totalCalls, 0);
+      assert.equal(db.getToolCallStats('session-a').byTool.ctx_index.calls, 1);
+      assert.equal(db.getEventBytesSummary('unrelated-latest-a').bytesAvoided, 0);
+      db.close();
+    `);
+  });
+});
+
+
+describe("Codex per-request sandbox metadata foundation", () => {
+  test("Windows executable paths must include a drive or UNC share", () => {
+    for (const value of ["/host/codex.exe", String.raw`\host\codex.exe`, "C:codex.exe"]) {
+      expect(isFullyQualifiedExecutable(value, "win32"), value).toBe(false);
+    }
+    for (const value of [String.raw`C:\host\codex.exe`, String.raw`\\server\share\codex.exe`, "//server/share/codex.exe"]) {
+      expect(isFullyQualifiedExecutable(value, "win32"), value).toBe(true);
+    }
+  });
+
+  const state = () => ({
+    permissionProfile: { type: "future-profile", unknownPermission: { preserve: true } },
+    sandboxCwd: pathToFileURL(resolve("project A")).href,
+    codexLinuxSandboxExe: null,
+    useLegacyLandlock: false,
+    useMxc: false,
+    futureHostField: { nested: ["keep", 7, null] },
+  });
+  const parse = (value: unknown) => parseCodexRequestContext(
+    { _meta: { [CODEX_SANDBOX_STATE_META_CAPABILITY]: value } }, CODEX_MCP_CLIENT_NAME,
+  );
+
+  test("missing metadata is distinct from malformed metadata", () => {
+    expect(parseCodexRequestContext(undefined, CODEX_MCP_CLIENT_NAME)).toEqual({ kind: "absent" });
+    expect(parseCodexRequestContext({ _meta: { unrelated: {} } }, CODEX_MCP_CLIENT_NAME)).toEqual({ kind: "absent" });
+    for (const value of [null, [], "", {}, { permissionProfile: {}, sandboxCwd: "/raw/path" },
+      { permissionProfile: {}, sandboxCwd: "https://example.com/project" },
+      { permissionProfile: {}, sandboxCwd: "file:///project?query=1" },
+      { permissionProfile: {}, sandboxCwd: "file:///project%00" },
+      { permissionProfile: [], sandboxCwd: "file:///project" }]) {
+      expect(parse(value).kind).toBe("invalid");
+    }
+    expect(parseCodexRequestContext({ _meta: [] }, CODEX_MCP_CLIENT_NAME).kind).toBe("invalid");
+  });
+
+  test("uses file URI as locator and preserves the entire opaque contract", () => {
+    const input = state();
+    const result = parse(input);
+    expect(result.kind).toBe("present");
+    if (result.kind !== "present") throw new Error("invalid fixture");
+    expect(result.context.projectDir).toBe(resolve("project A"));
+    expect(JSON.parse(result.context.sandboxStateJson)).toEqual(input);
+    input.futureHostField.nested.push("mutated after parse");
+    expect(JSON.parse(result.context.sandboxStateJson).futureHostField.nested).toEqual(["keep", 7, null]);
+    expect(Object.isFrozen(result.context)).toBe(true);
+  });
+
+  test("does not authorize metadata from other clients or guess legacy executables", () => {
+    expect(parseCodexRequestContext({ _meta: { [CODEX_SANDBOX_STATE_META_CAPABILITY]: state() } }, "other").kind).toBe("invalid");
+    const result = parse(state());
+    if (result.kind !== "present") throw new Error("invalid fixture");
+    expect(() => codexSandboxCommand(result.context, [process.execPath, "-e", "0"])).toThrow(/No PATH or unsandboxed fallback/);
+    for (const codexExecutable of ["codex", "./codex", "file:///codex", "\u0000"]) {
+      expect(parse({ ...state(), codexExecutable }).kind).toBe("invalid");
+    }
+  });
+
+  test("forwards exact state and arguments without shell interpolation", () => {
+    const input = { ...state(), codexExecutable: resolve("trusted host", "codex") };
+    const result = parse(input);
+    if (result.kind !== "present") throw new Error("invalid fixture");
+    const command = codexSandboxCommand(result.context, [process.execPath, "-e", "console.log('literal; &')"]);
+    expect(command).toEqual({ executable: input.codexExecutable,
+      args: ["sandbox", "--sandbox-state-json", JSON.stringify(input), "--", process.execPath, "-e", "console.log('literal; &')"] });
+    expect(() => codexSandboxCommand(result.context, ["node"])).toThrow(/absolute executable/);
+  });
+
+  test("concurrent requests and rejected or cancelled scopes restore context", async () => {
+    const contexts = ["A", "B"].map(name => {
+      const parsed = parse({ ...state(), sandboxCwd: pathToFileURL(resolve(name)).href });
+      if (parsed.kind !== "present") throw new Error("invalid fixture");
+      return parsed.context;
+    });
+    await Promise.all(contexts.map(context => withCodexRequestContext(context, async () => {
+      expect(getCodexRequestContext()).toBe(context);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(getCodexRequestContext()).toBe(context);
+      expect(() => withCodexRequestContext(contexts[0], () => { throw new Error("denied"); })).toThrow("denied");
+      expect(getCodexRequestContext()).toBe(context);
+      const controller = new AbortController();
+      controller.abort();
+      await expect(withCodexRequestContext(contexts[0], async () => { controller.signal.throwIfAborted(); })).rejects.toThrow();
+      expect(getCodexRequestContext()).toBe(context);
+    })));
+    expect(getCodexRequestContext()).toBeUndefined();
   });
 });

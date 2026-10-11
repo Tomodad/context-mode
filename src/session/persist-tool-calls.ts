@@ -40,8 +40,8 @@ export interface RestoredSessionStats {
 }
 
 /**
- * Increment the persistent tool-call counter for `toolName` under whatever
- * session_id `session_meta` currently treats as the most recent. This is
+ * Increment the persistent tool-call counter for `toolName` under an exact
+ * session, or the legacy latest session when no override was provided. This is
  * called from {@link trackResponse} on every tool response and must be
  * cheap, non-throwing, and best-effort — a stats failure must never break
  * the MCP tool call.
@@ -50,13 +50,15 @@ export function persistToolCallCounter(
   sessionDbPath: string,
   toolName: string,
   bytes: number,
+  opts?: { sessionId?: string | null; projectDir?: string },
 ): void {
   try {
-    if (!existsSync(sessionDbPath)) return;
+    if (opts?.sessionId === null || !existsSync(sessionDbPath)) return;
     const sdb = new SessionDB({ dbPath: sessionDbPath });
     try {
-      const sid = sdb.getLatestSessionId();
+      const sid = opts?.sessionId ?? sdb.getLatestSessionId();
       if (!sid) return;
+      if (opts?.sessionId) sdb.ensureSession(sid, opts.projectDir ?? "");
       sdb.incrementToolCall(sid, toolName, bytes);
     } finally {
       sdb.close();
