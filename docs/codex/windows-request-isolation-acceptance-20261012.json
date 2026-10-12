@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-12",
+  "scope": "Windows acceptance of explicit request-scoped project isolation; not Desktop project-root or sandbox execution acceptance",
+  "sourceCommit": "32cc1b28c3186d25247320a4294a7816eb227ec5",
+  "sourceTree": "09e3c6289a41932c07591d8b773a8572b64b13a7",
+  "parentCommit": "0aa672dcd05ef31bb8ddd563834f9a74aec70569",
+  "runtime": {
+    "platform": "win32",
+    "node": "24.13.0",
+    "abi": "137",
+    "ordinaryToken": true
+  },
+  "fixedDependencies": {
+    "typescript": "5.9.3",
+    "esbuild": "0.27.7",
+    "vitest": "4.1.5",
+    "better-sqlite3": "12.9.0",
+    "@modelcontextprotocol/sdk": "1.26.0",
+    "packageBytesMatchAcceptedBaseline": true,
+    "installedOrUpgraded": false
+  },
+  "build": {
+    "typescript": true,
+    "bundleAssertions": true,
+    "asymmetricDriftCheck": true
+  },
+  "tests": {
+    "targetedSource": {
+      "passed": 16,
+      "failed": 0,
+      "unselected": 499
+    },
+    "rebuiltBundleWindows": {
+      "passedScenarios": 6,
+      "coverage": [
+        "Chinese and space paths with concurrent project index/search/execution",
+        "exact session and stats attribution",
+        "AbortSignal cancellation with B recovery",
+        "A timeout with B recovery",
+        "A purge retains B content and accounting",
+        "Windows file URI and opaque metadata snapshot"
+      ],
+      "cancelledAndTimedOutChildrenGone": true,
+      "heartbeatStopped": true
+    },
+    "rebuiltCLI": {
+      "defaultMCPEntry": true,
+      "toolCount": 11,
+      "ownedContentIndexSearch": true,
+      "advertisesSandboxState": false
+    }
+  },
+  "bundles": {
+    "server": {
+      "sha256": "5b2db9c8383932d4f9d6e37d0757c8434dab1adc2c3bfd9e493a6e507bec323e"
+    },
+    "cli": {
+      "sha256": "fe447f79e8b6d293b5bf426246bd2184e19f5fd8be81dd1d8378efa702fe0035"
+    }
+  },
+  "anchorComparison": {
+    "serverChanged": true,
+    "otherSevenUnchanged": true,
+    "cliAlsoChangedBecauseItBundlesServer": true,
+    "otherFourGeneratedBundlesUnchanged": true
+  },
+  "production": {
+    "installationUnchanged": true,
+    "configurationUnchanged": true,
+    "permissionsUnchanged": true,
+    "modelTurns": 0
+  },
+  "limits": [
+    "Metadata foundation is not wired or advertised.",
+    "Explicit override tests do not establish a Desktop workspace-root fix.",
+    "Normal model handler metadata remains unverified.",
+    "No performance A/B or billing reduction claim.",
+    "Project content handles have no idle eviction policy."
+  ]
+}
