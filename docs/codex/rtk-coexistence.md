@@ -10,11 +10,21 @@ Upstream license, authorship, and the behavior of other platforms are retained.
 - The RTK native PreToolUse hook is the sole owner of supported Shell
   rewrites. Context Mode still evaluates its explicit Shell security policies
   before returning passthrough in Codex.
+- On the verified Windows `functions.exec` -> `tools.exec_command` bridge,
+  automatic RTK filtering remains unproven; use explicit RTK for supported
+  commands until an end-to-end nonempty control passes. Enabled/trusted
+  registration and an isolated handler test do not establish that control.
 - Context Mode provides on-demand analysis and indexed retrieval. Its
   existing PostToolUse and session lifecycle hooks retain event capture and
   resume behavior. Capture is not a promise of complete raw-output retention.
 - Native/project authorization and exact-output requirements continue to
   apply. `rtk proxy` selects unfiltered execution; it is not a permission grant.
+- Prefer CTX for large-document/log analysis and repeated retrieval. Read
+  raw inputs inside the analysis tool when complete data is required; do not
+  substitute an RTK summary. Short reads and exact edit ranges may stay on
+  native tools. Index by path only when persistent retrieval is useful.
+- PowerShell cmdlets run inside PowerShell, not as RTK executable commands.
+  Shell-provider errors require separate execution controls.
 
 ## Instruction entry points
 
@@ -75,3 +85,20 @@ manifests, and server/CLI bundles retain their original hashes.
 This is targeted module, hook-program, and native-loader acceptance. It does
 not prove routing/performance in a restarted interactive conversation. The
 full Vitest suite was not run: the installed cache lacks Vitest's CLI payload.
+
+## Instruction maintenance (2026-10-12)
+
+The user authorized updates to the active Codex global AGENTS.md and RTK.md,
+this Codex-specific reference, the focused Codex skill, and the installer
+snippet. Large-document/log analysis and repeated retrieval now have explicit
+CTX guidance while the bridge-path RTK workaround remains in place.
+
+A local project AGENTS.override.md provides Codex-specific guidance without
+editing the original shared AGENTS.md or Claude configuration. Hook
+definitions, trust, server bundles, credentials, and permissions are outside
+this Markdown maintenance scope. The edits do not prove live hook dispatch.
+
+Backups, a reapplication patch, native-loader inventory, and isolated hook
+evidence are kept in the workspace's local acceptance artifacts. The pinned
+fork commit is unchanged; a future reinstall must retain or reapply these
+local documentation updates separately.

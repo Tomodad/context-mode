@@ -10,9 +10,14 @@ large data without returning the full data to the conversation.
 
 ## Ownership
 
-- When enabled, the RTK native hook rewrites supported Shell commands.
+- RTK owns supported Shell rewrites on verified native-hook paths. On the
+  Windows Codex `functions.exec` -> `tools.exec_command` bridge, use explicit
+  RTK until automatic filtering is verified; avoid double wrapping.
 - Do not redirect a command to CTX merely because it reads, tests, builds,
   fetches a URL, or calls an API. A bounded native or RTK result may suffice.
+- Prefer CTX when analyzing a large document/log or retrieving its contents
+  repeatedly. Short reads and exact edit ranges stay on native tools when
+  that output is already sufficient.
 - CTX hooks retain security checks and session capture. Event capture does
   not guarantee that complete raw command output was indexed.
 - Respect the user's tool pauses, output requirements, and scope. Historical
@@ -46,6 +51,9 @@ already-returned data just to comply with a routing rule.
   execution surface for mutations, authentication, and interactive work.
 - On Windows, use host-correct PowerShell syntax or resolved JS/Python
   interpreters. Do not assume Bash or convert drive paths without evidence.
+- Run PowerShell cmdlets inside PowerShell; they are not RTK executable
+  subcommands. A shell-provider failure must not be labeled a CTX failure
+  without an independent execution control.
 - For browser or MCP tools, use only the capabilities actually exposed by
   this host; prefer file output when supported and useful.
 - After an execution timeout or crash, use bounded native/RTK alternatives
