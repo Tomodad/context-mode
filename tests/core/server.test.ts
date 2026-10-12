@@ -6794,6 +6794,25 @@ describe("request-scoped project isolation", () => {
     }
   }
 
+  test.each(["relevance", "timeline"])("immediate scoped search in %s sees indexing before deferred attribution", (sort) => {
+    runIsolatedScenario(`
+      seed(a, 'unrelated-latest');
+      seed(b, 'unrelated-latest');
+      await Promise.all([[a, 'ALPHA', 'BRAVO'], [b, 'BRAVO', 'ALPHA']].map(([project, own, other]) =>
+        scoped(project, async () => {
+          await tool('ctx_index', { content: 'immediatesearchneedle ONLY_PROJECT_' + own, source: 'immediate-source' });
+          // No flush, timer or subprocess: session accounting has not run yet.
+          const found = await tool('ctx_search', { queries: ['immediatesearchneedle'], source: 'immediate-source', sort: '${sort}' });
+          assert.ok(found.includes('ONLY_PROJECT_' + own), found);
+          assert.ok(!found.includes('ONLY_PROJECT_' + other), found);
+          const wrongProject = await tool('ctx_search', { queries: ['immediatesearchneedle'], source: 'immediate-source',
+            sort: '${sort}', project: project === a ? b : a });
+          assert.ok(!wrongProject.includes('ONLY_PROJECT_' + own), wrongProject);
+        })
+      ));
+    `);
+  });
+
   test("concurrent index, search, execute and throttling stay in their project", () => {
     runIsolatedScenario(`
       writeFileSync(join(a, 'marker.txt'), 'ONLY_PROJECT_ALPHA');

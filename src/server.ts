@@ -2935,6 +2935,16 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
         } catch { /* best-effort */ }
       }
 
+      // Indexing completes before best-effort session accounting runs. Include
+      // this exact request's session so an immediate search sees its writes,
+      // while an explicitly different project keeps its existing filter.
+      const scopedContext = projectDirOverride.getStore();
+      if (typeof projectScope === "string" && scopedContext?.sessionId
+        && resolve(projectScope) === resolve(scopedContext.projectDir)) {
+        relevanceAllowSet ??= new Set<string>();
+        relevanceAllowSet.add(scopedContext.sessionId);
+      }
+
       const configDir = _detectedAdapter?.getConfigDir() ?? resolveClaudeConfigDir();
 
       try {
@@ -2958,6 +2968,7 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
             configDir,
             adapter: _detectedAdapter ?? undefined,
             projectScope,
+            sessionIdAllowSet: relevanceAllowSet,
           });
         } else {
           results = store.searchWithFallback(
